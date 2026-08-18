@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -56,15 +57,15 @@ void print_endpoint(Endpoint endpoint) {
   printf("Endpoint: %s:%u\n", ip_string, endpoint.port);
 }
 
-int get_socket_endpoint(int sock, Endpoint *out_endpoint) {
-  struct addrinfo hints = {
-    .ai_family   = AF_INET,
-    .ai_socktype = SOCK_DGRAM,
-    .ai_flags    = AI_NUMERICSERV
-  };
+struct addrinfo addr_hints = {
+  .ai_family   = AF_INET,
+  .ai_socktype = SOCK_DGRAM,
+  .ai_flags    = AI_NUMERICSERV
+};
 
+int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
   struct addrinfo *stun_server;
-  int ret = getaddrinfo("stun.l.google.com", "19302", &hints, &stun_server);
+  int ret = getaddrinfo("stun.l.google.com", "19302", &addr_hints, &stun_server);
   if (ret != 0) {
     fprintf(stderr, "Could not get addrinfo for STUN server\n");
     return -1;
@@ -181,17 +182,115 @@ int get_socket_endpoint(int sock, Endpoint *out_endpoint) {
   return 0;
 }
 
-int main() {
+int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
+  struct sockaddr_in addr;
+  socklen_t addr_len = sizeof(addr);
+  
+  if (getsockname(sock, (struct sockaddr *)&addr, &addr_len) == -1) {
+    fprintf(stderr, "Could not get local socket endpoint\n");
+    return -1;
+  }
+  
+  out_endpoint->port = ntohs(addr.sin_port);
+  out_endpoint->addr = ntohl(addr.sin_addr.s_addr);
+  return 0;
+}
+
+#define LINE_BUF_SIZE 100
+#define PACKET_MAGIC 0xCAFE
+#define PACKET_BUF_SIZE 1500
+
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
+    return -1;
+  }
+
+  bool server = false;
+  if (strcmp("server", argv[1]) == 0) {
+    server = true;
+  } else if (strcmp("client", argv[1]) == 0) {
+    server = false;
+  } else {
+    fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
+    return -1;
+  }
+
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
-  Endpoint endpoint;
-  int res = get_socket_endpoint(sock, &endpoint);
+  Endpoint public_endpoint;
+  int res = get_socket_public_endpoint(sock, &public_endpoint);
   if (res < 0) {
     close(sock);
     exit(1);
   }
 
-  print_endpoint(endpoint);
+  Endpoint local_endpoint;
+  res = get_socket_local_endpoint(sock, &local_endpoint);
+  if (res < 0) {
+    close(sock);
+    exit(1);
+  }
+
+  printf("Public ");
+  print_endpoint(public_endpoint);
+
+  printf("Local ");
+  print_endpoint(local_endpoint);
+
+  printf("Where sould I connect (IP:PORT)? ");
+  char line[LINE_BUF_SIZE];
+  fgets(line, LINE_BUF_SIZE, stdin);
+  char *ip = strtok(line, ":");
+  char *port = strtok(NULL, "\n\r");
+
+  printf("You have entered ip %s and port %s.\n", ip, port);
+
+  struct addrinfo *peer_addr;
+  int ret = getaddrinfo(ip, port, &addr_hints, &peer_addr);
+  if (ret != 0) {
+    fprintf(stderr, "Could not get addrinfo for STUN server\n");
+    return -1;
+  }
+
+  if (server) {
+    char *connect_buf = "connect";
+    sendto(sock, connect_buf, strlen(connect_buf), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+
+    char buf[1000];
+    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
+    if (strncmp("ack", buf, bytes_recv) != 0) {
+      printf("not received ack\n");
+    }
+
+    char *data1 = "data1";
+    char *data2 = "data2";
+    char *data3 = "exit";
+    sendto(sock, data1, strlen(data1), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+    sendto(sock, data2, strlen(data2), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+    sendto(sock, data3, strlen(data3), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+  } else {
+    char buf[1000];
+    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
+    if (strncmp("connect", buf, bytes_recv) != 0) {
+      printf("not received connect\n");
+    }
+
+    char *ack_buf = "ack";
+    sendto(sock, ack_buf, strlen(ack_buf), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+
+    bool should_exit = false;
+    while (!should_exit) {
+      uint8_t buf[STUN_BUFFER_SIZE + 1];
+      ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
+      buf[bytes_recv] = 0;
+      printf("%s\n", buf);
+      if (strcmp((char *)buf, "exit") == 0) {
+        should_exit = true;
+      }
+    }
+  }
 
   close(sock);
 }
