@@ -196,10 +196,259 @@ int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
   return 0;
 }
 
-#define LINE_BUF_SIZE 100
-#define PACKET_MAGIC 0xCAFE
-#define PACKET_BUF_SIZE 1500
+// ----------------------------------------------
 
+#define LINE_BUF_SIZE 100
+
+typedef enum {
+    _RESERVED = 0,
+    PACK_INVALID,
+    PACK_TYP_ACK,
+    PACK_TYP_CONNECT,
+    PACK_TYP_CLOSE,
+    PACK_TYP_DATA,
+    PACK_TYP_DATA_ACK,
+} PacketType;
+
+typedef struct {
+    uint8_t type;
+    uint8_t _reserved;
+    uint16_t checksum;
+    union {
+        uint32_t offset;
+        uint32_t id;
+    };
+    union {
+        uint32_t length;
+        uint32_t ack_id;
+    };
+} PacketHeader;
+static_assert(sizeof(PacketHeader) == 12, "packet header struct wrongly packed");
+
+// Minimum MTU - max size IP Header - UDP Header - Packet Header
+#define MAX_PACKET_PAYLOAD_SIZE (508 - sizeof(PacketHeader))
+
+typedef struct {
+    int fd;
+    __CONST_SOCKADDR_ARG addr;
+    socklen_t addr_len;
+} Peer;
+
+void send_ack(Peer peer, uint32_t id, uint32_t ack_id) {
+    PacketHeader p = {
+        .type = PACK_TYP_ACK,
+        ._reserved = 0,
+        .checksum = 0,
+        .id = id,
+        .ack_id = ack_id,
+    };
+
+    sendto(peer.fd, &p, sizeof(p), 0, peer.addr, peer.addr_len);
+}
+void send_connect(Peer peer, uint32_t id, uint32_t ack_id) {
+    PacketHeader p = {
+        .type = PACK_TYP_CONNECT,
+        ._reserved = 0,
+        .checksum = 0,
+        .id = id,
+        .ack_id = ack_id,
+    };
+
+    sendto(peer.fd, &p, sizeof(p), 0, peer.addr, peer.addr_len);
+}
+void send_close(Peer peer, uint32_t id, uint32_t ack_id) {
+    PacketHeader p = {
+        .type = PACK_TYP_CLOSE,
+        ._reserved = 0,
+        .checksum = 0,
+        .id = id,
+        .ack_id = ack_id,
+    };
+
+    sendto(peer.fd, &p, sizeof(p), 0, peer.addr, peer.addr_len);
+}
+void send_data(Peer peer, uint32_t offset, uint32_t length, void *data) {
+    assert(length <= MAX_PACKET_PAYLOAD_SIZE);
+    uint8_t buffer[MAX_PACKET_PAYLOAD_SIZE + sizeof(PacketHeader)] = {0};
+    PacketHeader p = {
+        .type = PACK_TYP_DATA,
+        ._reserved = 0,
+        .checksum = 0,
+        .offset = offset,
+        .length = length,
+    };
+
+    memcpy(&buffer[0], &p, sizeof(p));
+    memcpy(&buffer[sizeof(p)], data, length);
+
+    sendto(peer.fd, buffer, sizeof(PacketHeader) + length, 0, peer.addr, peer.addr_len);
+}
+void send_data_ack(Peer peer, uint32_t offset, uint32_t length) {
+    PacketHeader p = {
+        .type = PACK_TYP_DATA_ACK,
+        ._reserved = 0,
+        .checksum = 0,
+        .offset = offset,
+        .length = length,
+    };
+
+    sendto(peer.fd, &p, sizeof(p), 0, peer.addr, peer.addr_len);
+}
+
+PacketHeader parse_packet(void *packet, size_t packet_len, void **data) {
+    PacketHeader ph = {0};
+      
+    if (packet_len < (ssize_t)sizeof(PacketHeader)) {
+      printf("Received malformed packet\n");
+      ph.type = PACK_INVALID;
+      return ph;
+    }
+
+    memcpy(&ph, packet, sizeof(PacketHeader));
+
+    if (ph.type == PACK_TYP_DATA) {
+        if (ph.length + sizeof(PacketHeader) > packet_len) {
+            printf("data packet incomplete (not enought data)\n");
+            ph.type = PACK_INVALID;
+            return ph;
+        }
+    }
+
+    if (data != NULL) {
+        *data = packet + sizeof(PacketHeader);
+    }
+    return ph;
+}
+
+#define PACKS_PER_BLOCK 1024
+#define BLOCK_SIZE (MAX_PACKET_PAYLOAD_SIZE * PACKS_PER_BLOCK)
+
+typedef struct {
+    uint32_t offset;
+    uint32_t length;
+    bool confirmed;
+} PacketTracker;
+
+void sender(Peer peer) {
+    send_connect(peer, 0, 0);
+
+    char buf[1000];
+    ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL); 
+    PacketHeader ph_ack = parse_packet(buf, bytes_recv, NULL);
+    if (ph_ack.type != PACK_TYP_ACK) {
+        printf("did not get ack");;
+    }
+
+    FILE *fp = fopen("./image.jpg", "rb");
+
+    uint32_t filebuffer_offset = 0;
+    uint32_t filebuffer_offset_next = 0;
+    uint8_t filebuffer[BLOCK_SIZE];
+    PacketTracker pt[PACKS_PER_BLOCK] = {0};
+    int pt_idx = 0;
+    int pt_cap = 0;
+    bool exit = false;
+    while (!exit) {
+
+        // HANDLE ACKS AND PACKETS RECEIVED
+        while((bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL)) != (ssize_t)-1) {
+            PacketHeader ph = parse_packet(buf, bytes_recv, NULL);
+            if (ph.type == PACK_TYP_DATA_ACK) {
+                for (int i = 0; i < pt_idx; i++) {
+                    if (pt[i].offset + filebuffer_offset == ph.offset) {
+                        pt[i].confirmed = true;
+                    }
+                }
+            }
+        }
+
+        // CHECK IF NEW BLOCK IS NEEDED
+        bool should_new_block = true;
+        for (int i = 0; i < pt_idx; i++) {
+            if (!pt[i].confirmed) {
+                should_new_block = false;
+                break;
+            }
+        }
+        if (pt_idx < pt_cap) should_new_block = false;
+
+        // MOVE TO NEW BLOCK
+        if (should_new_block) {
+            printf("new block\n");
+            filebuffer_offset = filebuffer_offset_next;
+            int len = fread(filebuffer, 1, BLOCK_SIZE, fp);
+            if (len == 0) {
+                exit = true;
+                break;
+            }
+            filebuffer_offset_next += len;
+            pt_idx = 0;
+            pt_cap = (len + MAX_PACKET_PAYLOAD_SIZE - 1) / MAX_PACKET_PAYLOAD_SIZE;
+        }
+
+        // CREATE NEW PACKET TRACKER
+        if (pt_idx < pt_cap) {
+            uint32_t offset = pt_idx * MAX_PACKET_PAYLOAD_SIZE;
+            uint32_t remaining = filebuffer_offset_next - filebuffer_offset - offset;
+            uint32_t length = (remaining > MAX_PACKET_PAYLOAD_SIZE) ? MAX_PACKET_PAYLOAD_SIZE : remaining;
+            pt[pt_idx] = (PacketTracker){
+                .offset = offset,
+                .length = length,
+                .confirmed = false,
+            };
+            pt_idx++;
+        }
+
+        // SEND UNCONFIRMED PACKETS
+        for (int i = 0; i < pt_idx; i++) {
+            if (!pt[i].confirmed) {
+                send_data(peer, pt[i].offset + filebuffer_offset, pt[i].length, filebuffer + pt[i].offset);
+            }
+        }
+    }
+
+    send_close(peer, 0, 0);
+}
+
+void client(Peer peer) {
+    char buf[1000];
+    ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL);
+    PacketHeader ph_connect = parse_packet(buf, bytes_recv, NULL);
+    if (ph_connect.type != PACK_TYP_CONNECT) {
+        printf("did not get connect");;
+    }
+
+    send_ack(peer, 0, 0);
+
+    FILE *fp = fopen("./recv_image.jpg", "wb");
+    fseek(fp, 0, SEEK_SET);
+    bool should_exit = false;
+    while (!should_exit) {
+      uint8_t buf[STUN_BUFFER_SIZE + 1];
+      ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL);
+
+      void *data;
+      PacketHeader ph = parse_packet(buf, bytes_recv, &data);
+
+      switch (ph.type) {
+          case PACK_TYP_CLOSE: {
+            should_exit = true;
+          } break;
+
+          case PACK_TYP_DATA: {
+            fseek(fp, ph.offset, SEEK_SET);
+            fwrite(data, 1, ph.length, fp);
+            send_data_ack(peer, ph.offset, ph.length);
+          } break;
+
+          default:
+              break;
+      }
+
+    }
+
+    fflush(fp);
+}
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -254,43 +503,18 @@ int main(int argc, char **argv) {
     return -1;
   }
 
+  Peer peer = {
+      .fd = sock,
+      .addr = peer_addr->ai_addr,
+      .addr_len = peer_addr->ai_addrlen,
+  };
+
   if (server) {
-    char *connect_buf = "connect";
-    sendto(sock, connect_buf, strlen(connect_buf), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
-
-    char buf[1000];
-    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
-    if (strncmp("ack", buf, bytes_recv) != 0) {
-      printf("not received ack\n");
-    }
-
-    char *data1 = "data1";
-    char *data2 = "data2";
-    char *data3 = "exit";
-    sendto(sock, data1, strlen(data1), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
-    sendto(sock, data2, strlen(data2), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
-    sendto(sock, data3, strlen(data3), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
+      sender(peer);
   } else {
-    char buf[1000];
-    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
-    if (strncmp("connect", buf, bytes_recv) != 0) {
-      printf("not received connect\n");
-    }
-
-    char *ack_buf = "ack";
-    sendto(sock, ack_buf, strlen(ack_buf), 0, peer_addr->ai_addr, peer_addr->ai_addrlen);
-
-    bool should_exit = false;
-    while (!should_exit) {
-      uint8_t buf[STUN_BUFFER_SIZE + 1];
-      ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf), 0, NULL, NULL);
-      buf[bytes_recv] = 0;
-      printf("%s\n", buf);
-      if (strcmp((char *)buf, "exit") == 0) {
-        should_exit = true;
-      }
-    }
+      client(peer);
   }
+
 
   close(sock);
 }
