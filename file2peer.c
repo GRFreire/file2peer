@@ -190,6 +190,19 @@ int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
     fprintf(stderr, "Could not get local socket endpoint\n");
     return -1;
   }
+
+  if (addr.sin_port == 0) {
+    int ret = bind(sock, (struct sockaddr *)&addr, addr_len);
+    if (ret == -1) {
+      fprintf(stderr, "Could not bind to any port\n");
+      return -1;
+    }
+
+    if (getsockname(sock, (struct sockaddr *)&addr, &addr_len) == -1) {
+      fprintf(stderr, "Could not get local socket endpoint\n");
+      return -1;
+    }
+  }
   
   out_endpoint->port = ntohs(addr.sin_port);
   out_endpoint->addr = ntohl(addr.sin_addr.s_addr);
