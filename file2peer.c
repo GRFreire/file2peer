@@ -463,6 +463,107 @@ void client(Peer peer) {
     fflush(fp);
 }
 
+Peer find_peer(int sock, Endpoint my_endpoint, int id) {
+  struct addrinfo *ers_server;
+  int ret = getaddrinfo("0.0.0.0", "54321", &addr_hints, &ers_server);
+  if (ret != 0) {
+    fprintf(stderr, "Could not get addrinfo for ers server\n");
+    exit(1);
+  }
+
+  struct in_addr ip;
+  ip.s_addr = htonl(my_endpoint.addr);
+
+  char ip_string[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &ip, ip_string, sizeof(ip_string));
+
+  char req[128];
+  int req_len = snprintf(req, sizeof(req), "REGISTER %d\n%s:%u", id, ip_string, my_endpoint.port);
+  sendto(
+      sock,
+      req,
+      req_len,
+      0,
+      ers_server->ai_addr,
+      ers_server->ai_addrlen
+  );
+
+  req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
+  sendto(
+      sock,
+      req,
+      req_len,
+      0,
+      ers_server->ai_addr,
+      ers_server->ai_addrlen
+  );
+
+  Peer peer = {0};
+  bool found_peer = false;
+  while(!found_peer) {
+    char buf[1000];
+    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf) - 1, 0, NULL, NULL); 
+    buf[bytes_recv] = 0;
+    char *buf_ptr = buf;
+
+    char *reply = strsep(&buf_ptr, " ");
+    if (strcmp(reply, "ENTRIES") != 0) continue;
+
+    char *id_str = strsep(&buf_ptr, "\n");
+    int reply_id = atoi(id_str);
+
+    if (reply_id != id) {
+        printf("got entries for other id. my id: %d received: %d\n", id, reply_id);
+        continue;
+    }
+
+    while (buf_ptr != NULL && buf_ptr[0] != 0) {
+        char *payload = strsep(&buf_ptr, "\n");
+
+        char *reply_ip_str = strsep(&payload, ":");
+        char *reply_port_str = payload;
+        int reply_port = atoi(reply_port_str);
+
+        if (strcmp(reply_ip_str, ip_string) == 0 && reply_port == my_endpoint.port) continue;
+
+        struct addrinfo *peer_addr;
+        int ret = getaddrinfo(reply_ip_str, reply_port_str, &addr_hints, &peer_addr);
+        if (ret != 0) {
+          fprintf(stderr, "Could not get addrinfo for peer\n");
+          continue;
+        }
+
+        peer = (Peer){
+            .fd = sock,
+            .addr = peer_addr->ai_addr,
+            .addr_len = peer_addr->ai_addrlen,
+        };
+
+        found_peer = true;
+
+        printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
+        break;
+    }
+
+    if (!found_peer) {
+        req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
+        sendto(
+            sock,
+            req,
+            req_len,
+            0,
+            ers_server->ai_addr,
+            ers_server->ai_addrlen
+        );
+    }
+
+  }
+
+  return peer;
+}
+
+#define LOCAL 1
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
@@ -481,46 +582,34 @@ int main(int argc, char **argv) {
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
-  Endpoint public_endpoint;
-  int res = get_socket_public_endpoint(sock, &public_endpoint);
+  Endpoint endpoint;
+  int res;
+  if (LOCAL) {
+    res = get_socket_local_endpoint(sock, &endpoint);
+  } else {
+    res = get_socket_public_endpoint(sock, &endpoint);
+  }
   if (res < 0) {
     close(sock);
     exit(1);
   }
 
-  Endpoint local_endpoint;
-  res = get_socket_local_endpoint(sock, &local_endpoint);
-  if (res < 0) {
-    close(sock);
-    exit(1);
+  print_endpoint(endpoint);
+
+  int id;
+  if (server) {
+      srand(time(0));
+      id = rand();
+      printf("ID: %d\n", id);
+  } else {
+      printf("What is the ID? ");
+      char line[LINE_BUF_SIZE];
+      fgets(line, LINE_BUF_SIZE, stdin);
+      char *id_str = strtok(line, "\n\r");
+      id = atoi(id_str);
   }
 
-  printf("Public ");
-  print_endpoint(public_endpoint);
-
-  printf("Local ");
-  print_endpoint(local_endpoint);
-
-  printf("Where sould I connect (IP:PORT)? ");
-  char line[LINE_BUF_SIZE];
-  fgets(line, LINE_BUF_SIZE, stdin);
-  char *ip = strtok(line, ":");
-  char *port = strtok(NULL, "\n\r");
-
-  printf("You have entered ip %s and port %s.\n", ip, port);
-
-  struct addrinfo *peer_addr;
-  int ret = getaddrinfo(ip, port, &addr_hints, &peer_addr);
-  if (ret != 0) {
-    fprintf(stderr, "Could not get addrinfo for STUN server\n");
-    return -1;
-  }
-
-  Peer peer = {
-      .fd = sock,
-      .addr = peer_addr->ai_addr,
-      .addr_len = peer_addr->ai_addrlen,
-  };
+  Peer peer = find_peer(sock, endpoint, id);
 
   if (server) {
       sender(peer);
