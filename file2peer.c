@@ -3,10 +3,12 @@
 #include <errno.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -222,14 +224,15 @@ typedef struct {
 
 #define RING_BUFFER_CAP 102400
 typedef struct {
-  int head;
-  int tail;
+  _Atomic int head;
+  _Atomic int tail;
   UDPPacket *data;
+  sem_t sem;
 } UDPRingBuffer;
 
 typedef struct {
   int sock;
-  bool should_exit;
+  _Atomic int should_exit;
   UDPRingBuffer *ring;
 } ThreadArgs;
 
@@ -238,47 +241,100 @@ void *writer(void *arg) {
   UDPRingBuffer *ring = args->ring;
 
   while (true) {
-    if (args->should_exit && ring->head == ring->tail) {
+    sem_wait(&ring->sem);
+
+    int should_exit = atomic_load(&args->should_exit);
+    int tail = atomic_load(&ring->tail);
+    int head = atomic_load(&ring->head);
+      
+    if (should_exit && head == tail) {
       pthread_exit(NULL);
     }
 
-    if (ring->head == ring->tail) {
-      struct timespec ts = {
-        .tv_sec = 0,
-        .tv_nsec = 250 * 1000 * 1000,
-      };
-
-      nanosleep(&ts, &ts);
-      continue;
-    }
-
-    UDPPacket p = ring->data[ring->tail];
-    ring->tail++;
-    ring->tail %= RING_BUFFER_CAP;
+    UDPPacket p = ring->data[tail];
+    tail++;
+    tail %= RING_BUFFER_CAP;
 
     sendto(args->sock, &p.buf, p.len, 0, p.dest_addr, p.addrlen);
+
+    atomic_store(&ring->tail, tail);
   }
 
   return NULL;
 }
 
-void add_to_writer(UDPRingBuffer *ring, void *buf, size_t len, struct sockaddr *dest_addr, socklen_t addrlen) {
+int add_to_writer(UDPRingBuffer *ring, void *buf, size_t len, struct sockaddr *dest_addr, socklen_t addrlen) {
   assert(len <= MAX_UDP_PACKET_SIZE);
 
-  int new_head = (ring->head + 1) % RING_BUFFER_CAP;
-  if (new_head == ring->tail) {
-    // ring full
-    // TODO: return error: full
-    printf("ring full\n");
-    return;
+  int head = atomic_load(&ring->head);
+  int tail = atomic_load(&ring->tail);
+  int new_head = (head + 1) % RING_BUFFER_CAP;
+  if (new_head == tail) {
+    return -1;
   }
 
-  UDPPacket *p = &ring->data[ring->head];
+  UDPPacket *p = &ring->data[head];
   p->len = len;
   p->dest_addr = dest_addr;
   p->addrlen = addrlen;
   memcpy(p->buf, buf, len);
-  ring->head = new_head;
+
+  atomic_store(&ring->head, new_head);
+  sem_post(&ring->sem);
+
+  return 0;
+}
+
+void *reader(void *arg) {
+  ThreadArgs *args = (ThreadArgs *)arg;
+  UDPRingBuffer *ring = args->ring;
+
+  while (true) {
+    sem_wait(&ring->sem);
+    int should_exit = atomic_load(&args->should_exit);
+    if (should_exit) {
+      pthread_exit(NULL);
+    }
+
+    int head = atomic_load(&ring->head);
+    int tail = atomic_load(&ring->tail);
+    int new_head = (head + 1) % RING_BUFFER_CAP;
+    if (new_head == tail) {
+      // ring full
+      assert(false && "semaphore should have handled full ring");
+    }
+
+    UDPPacket *p = &ring->data[head];
+    ssize_t bytes_recv = recvfrom(args->sock, &p->buf, MAX_UDP_PACKET_SIZE, 0, NULL, NULL); 
+    if (bytes_recv == (ssize_t)-1) {
+      sem_post(&ring->sem);
+      continue;
+    }
+
+    p->len = bytes_recv;
+    p->dest_addr = NULL;
+    p->addrlen = 0;
+
+    atomic_store(&ring->head, new_head);
+  }
+
+  return NULL;
+}
+
+int take_from_reader(UDPRingBuffer *ring, UDPPacket *packet) {
+  int tail = atomic_load(&ring->tail);
+  int head = atomic_load(&ring->head);
+
+
+  if (head == tail) {
+    return -1;
+  }
+
+  *packet = ring->data[tail];
+
+  atomic_store(&ring->tail, (tail + 1) % RING_BUFFER_CAP);
+  sem_post(&ring->sem);
+  return 0;
 }
 
 #define LINE_BUF_SIZE 100
@@ -286,9 +342,10 @@ void add_to_writer(UDPRingBuffer *ring, void *buf, size_t len, struct sockaddr *
 typedef enum {
     _RESERVED = 0,
     PACK_INVALID,
-    PACK_TYP_ACK,
     PACK_TYP_CONNECT,
+    PACK_TYP_CONNECT_ACK,
     PACK_TYP_CLOSE,
+    PACK_TYP_CLOSE_ACK,
     PACK_TYP_DATA,
     PACK_TYP_DATA_ACK,
 } PacketType;
@@ -317,18 +374,18 @@ typedef struct {
     socklen_t addr_len;
 } Peer;
 
-void send_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
+int send_ack(UDPRingBuffer *packet_ring, Peer peer, PacketType type, uint32_t id, uint32_t ack_id) {
     PacketHeader p = {
-        .type = PACK_TYP_ACK,
+        .type = type,
         ._reserved = 0,
         .checksum = 0,
         .id = id,
         .ack_id = ack_id,
     };
 
-    add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
 }
-void send_connect(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
+int send_connect(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
     PacketHeader p = {
         .type = PACK_TYP_CONNECT,
         ._reserved = 0,
@@ -337,9 +394,9 @@ void send_connect(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t a
         .ack_id = ack_id,
     };
 
-    add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
 }
-void send_close(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
+int send_close(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
     PacketHeader p = {
         .type = PACK_TYP_CLOSE,
         ._reserved = 0,
@@ -348,9 +405,9 @@ void send_close(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack
         .ack_id = ack_id,
     };
 
-    add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
 }
-void send_data(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length, void *data) {
+int send_data(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length, void *data) {
     assert(length <= MAX_PACKET_PAYLOAD_SIZE);
     uint8_t buffer[MAX_PACKET_PAYLOAD_SIZE + sizeof(PacketHeader)] = {0};
     PacketHeader p = {
@@ -364,9 +421,9 @@ void send_data(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t 
     memcpy(&buffer[0], &p, sizeof(p));
     memcpy(&buffer[sizeof(p)], data, length);
 
-    add_to_writer(packet_ring, buffer, sizeof(PacketHeader) + length, peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, buffer, sizeof(PacketHeader) + length, peer.addr, peer.addr_len);
 }
-void send_data_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length) {
+int send_data_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length) {
     PacketHeader p = {
         .type = PACK_TYP_DATA_ACK,
         ._reserved = 0,
@@ -375,7 +432,7 @@ void send_data_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint3
         .length = length,
     };
 
-    add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
 }
 
 PacketHeader parse_packet(void *packet, size_t packet_len, void **data) {
@@ -412,13 +469,201 @@ typedef struct {
     bool confirmed;
 } PacketTracker;
 
-void sender(UDPRingBuffer *packet_ring, Peer peer) {
-    send_connect(packet_ring, peer, 0, 0);
+typedef enum {
+  S_UNCONNECTED = 0,
+  S_WAITING_CONNECTION,
+  S_OPEN_FILE,
+  S_CREATE_NEW_BLOCK,
+  S_HANDLE_ACKS,
+  S_SEND_PACKET,
+  S_SHOULD_CLOSE,
+  S_CLOSING_CONNECTION,
+  S_CLOSED_SHOULD_EXIT
+} SM_Sender;
 
-    char buf[1000];
-    ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL); 
-    PacketHeader ph_ack = parse_packet(buf, bytes_recv, NULL);
-    if (ph_ack.type != PACK_TYP_ACK) {
+#define NANOS_PER_SEC (1000 * 1000 * 1000)
+double seconds_since_unspecified_epoch(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
+}
+
+void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
+  SM_Sender state = S_UNCONNECTED;
+
+  double last_sent_connect;
+
+  FILE *fp;
+
+  uint32_t file_offset = 0;
+  uint32_t file_next_offset = 0;
+  uint8_t file_buffer[BLOCK_SIZE];
+  PacketTracker tracker[PACKS_PER_BLOCK] = {0};
+  int tracker_len = 0;
+
+  int packet_sending_idx = 0;
+
+  double last_sent_close;
+
+  while(state != S_CLOSED_SHOULD_EXIT) {
+    switch(state) {
+      case S_UNCONNECTED: {
+        printf("STATE: S_UNCONNECTED\n");
+        send_connect(writer_ring, peer, 0, 0);
+        last_sent_connect = seconds_since_unspecified_epoch();
+
+        state = S_WAITING_CONNECTION;
+      } break;
+      
+      case S_WAITING_CONNECTION: {
+        printf("STATE: S_WAITING_CONNECTION\n");
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+
+        if (ret == 0) {
+          PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+          if (ph.type == PACK_TYP_CONNECT_ACK) {
+            state = S_OPEN_FILE;
+            break;
+          }
+        }
+
+        double now = seconds_since_unspecified_epoch();
+        // TODO: 1 should be a define, and also the time to connect should be used as ping
+        if ((now - last_sent_connect) > 1) {
+          send_connect(writer_ring, peer, 0, 0);
+          last_sent_connect = now;
+        }
+      } break;
+
+      case S_OPEN_FILE: {
+        printf("STATE: S_OPEN_FILE\n");
+        fp = fopen("./image.jpg", "rb");
+        state = S_CREATE_NEW_BLOCK;
+      } break;
+
+      case S_CREATE_NEW_BLOCK: {
+        printf("STATE: S_CREATE_NEW_BLOCK\n");
+        file_offset = file_next_offset;
+        int len = fread(file_buffer, 1, BLOCK_SIZE, fp);
+        if (len == 0) {
+            state = S_SHOULD_CLOSE;
+            break;
+        }
+
+        file_next_offset += len;
+
+        tracker_len = (len + MAX_PACKET_PAYLOAD_SIZE - 1) / MAX_PACKET_PAYLOAD_SIZE;
+        for (int i = 0; i < tracker_len; i++) {
+          uint32_t offset = i * MAX_PACKET_PAYLOAD_SIZE;
+          uint32_t remaining = len - offset;
+          uint32_t length = (remaining > MAX_PACKET_PAYLOAD_SIZE) ? MAX_PACKET_PAYLOAD_SIZE : remaining;
+          tracker[i] = (PacketTracker){
+            .offset = offset,
+            .length = length,
+            .confirmed = false,
+          };
+        }
+
+        packet_sending_idx = 0;
+
+        state = S_SEND_PACKET;
+      } break;
+
+      case S_SEND_PACKET: {
+        printf("STATE: S_SEND_PACKET\n");
+
+        // TODO: each packet should have its own time when it was sent.
+        // Then, in this state, send all packets where enought time has
+        // passed. This eliminates the "static" state packet_sending_idx
+        // and implements sort of a rate limiting on the sending side.
+
+        int i;
+        for (i = packet_sending_idx; i < tracker_len && tracker[i].confirmed; i++) {}
+
+        if (i < tracker_len && !tracker[i].confirmed) {
+          packet_sending_idx++;
+          PacketTracker t = tracker[i];
+          send_data(writer_ring, peer, file_offset + t.offset, t.length, &file_buffer[t.offset]);
+
+          state = S_HANDLE_ACKS;
+          break;
+        }
+
+        for (i = 0; i < packet_sending_idx && tracker[i].confirmed; i++) {}
+
+        if (!tracker[i].confirmed) {
+          packet_sending_idx = i;
+
+          state = S_HANDLE_ACKS;
+          break;
+        }
+
+        state = S_CREATE_NEW_BLOCK;
+      } break;
+
+      case S_HANDLE_ACKS: {
+        printf("STATE: S_HANDLE_ACKS\n");
+        UDPPacket udp_packet;
+        while(take_from_reader(reader_ring, &udp_packet) != -1) {
+          PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+          if (ph.type == PACK_TYP_DATA_ACK) {
+            for (int i = 0; i < tracker_len; i++) {
+              if (file_offset + tracker[i].offset == ph.offset) {
+                tracker[i].confirmed = true;
+              }
+            }
+          }
+        }
+
+        state = S_SEND_PACKET;
+      } break;
+
+      case S_SHOULD_CLOSE: {
+        printf("STATE: S_SHOULD_CLOSE\n");
+        send_close(writer_ring, peer, 0, 0);
+        last_sent_close = seconds_since_unspecified_epoch();
+
+        state = S_CLOSING_CONNECTION;
+      } break;
+
+      case S_CLOSING_CONNECTION: {
+        printf("STATE: S_CLOSING_CONNECTION\n");
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+
+        if (ret == 0) {
+          PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+          if (ph.type == PACK_TYP_CLOSE_ACK) {
+            state = S_CLOSED_SHOULD_EXIT;
+            break;
+          }
+        }
+
+        double now = seconds_since_unspecified_epoch();
+        // TODO: 1 should be a define, and also the time to connect should be used as ping
+        if ((now - last_sent_close) > 1) {
+          send_close(writer_ring, peer, 0, 0);
+          last_sent_close = now;
+        }
+      } break;
+
+      case S_CLOSED_SHOULD_EXIT: {
+        printf("STATE: S_CLOSED_SHOULD_EXIT\n");
+        assert(false && "unreachable. state is exit conditon from while");
+      } break;
+    }
+  }
+}
+
+void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
+    send_connect(writer_ring, peer, 0, 0);
+
+    UDPPacket udp_packet;
+    while(take_from_reader(reader_ring, &udp_packet) == -1) {}
+    PacketHeader ph_ack = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+    if (ph_ack.type != PACK_TYP_CONNECT_ACK) {
         printf("did not get ack");;
     }
 
@@ -434,8 +679,8 @@ void sender(UDPRingBuffer *packet_ring, Peer peer) {
     while (!exit) {
 
         // HANDLE ACKS AND PACKETS RECEIVED
-        while((bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL)) != (ssize_t)-1) {
-            PacketHeader ph = parse_packet(buf, bytes_recv, NULL);
+        while(take_from_reader(reader_ring, &udp_packet) != -1) {
+            PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
             if (ph.type == PACK_TYP_DATA_ACK) {
                 for (int i = 0; i < pt_idx; i++) {
                     if (pt[i].offset + filebuffer_offset == ph.offset) {
@@ -485,7 +730,7 @@ void sender(UDPRingBuffer *packet_ring, Peer peer) {
         // SEND UNCONFIRMED PACKETS
         for (int i = 0; i < pt_idx; i++) {
             if (!pt[i].confirmed) {
-                send_data(packet_ring, peer, pt[i].offset + filebuffer_offset, pt[i].length, filebuffer + pt[i].offset);
+                send_data(writer_ring, peer, pt[i].offset + filebuffer_offset, pt[i].length, filebuffer + pt[i].offset);
 
                 struct timespec ts = {
                   .tv_sec = 0,
@@ -497,39 +742,43 @@ void sender(UDPRingBuffer *packet_ring, Peer peer) {
             }
         }
 
-    send_close(packet_ring, peer, 0, 0);
+    send_close(writer_ring, peer, 0, 0);
 }
 
-void client(UDPRingBuffer *packet_ring, Peer peer) {
-    char buf[1000];
-    ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL);
-    PacketHeader ph_connect = parse_packet(buf, bytes_recv, NULL);
+void client(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
+    UDPPacket udp_packet;
+    while(take_from_reader(reader_ring, &udp_packet) == -1) {}
+    PacketHeader ph_connect = parse_packet(udp_packet.buf, udp_packet.len, NULL);
     if (ph_connect.type != PACK_TYP_CONNECT) {
         printf("did not get connect");;
     }
 
-    send_ack(packet_ring, peer, 0, 0);
+    send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
 
     FILE *fp = fopen("./recv_image.jpg", "wb");
     fseek(fp, 0, SEEK_SET);
     bool should_exit = false;
     while (!should_exit) {
-      uint8_t buf[STUN_BUFFER_SIZE + 1];
-      ssize_t bytes_recv = recvfrom(peer.fd, &buf, sizeof(buf), 0, NULL, NULL);
+      int ret = take_from_reader(reader_ring, &udp_packet);
+      if (ret == -1) {
+        continue;
+      }
 
       void *data;
-      PacketHeader ph = parse_packet(buf, bytes_recv, &data);
+      PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, &data);
 
       switch (ph.type) {
           case PACK_TYP_CLOSE: {
             printf("got close\n");
+            send_ack(writer_ring, peer, PACK_TYP_CLOSE_ACK, 0, 0);
+            send_ack(writer_ring, peer, PACK_TYP_CLOSE_ACK, 0, 0);
             should_exit = true;
           } break;
 
           case PACK_TYP_DATA: {
             fseek(fp, ph.offset, SEEK_SET);
             fwrite(data, 1, ph.length, fp);
-            send_data_ack(packet_ring, peer, ph.offset, ph.length);
+            send_data_ack(writer_ring, peer, ph.offset, ph.length);
           } break;
 
           default:
@@ -541,7 +790,7 @@ void client(UDPRingBuffer *packet_ring, Peer peer) {
     fflush(fp);
 }
 
-Peer find_peer(int sock, Endpoint my_endpoint, int id) {
+Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock, Endpoint my_endpoint, int id) {
   struct addrinfo *ers_server;
   int ret = getaddrinfo("0.0.0.0", "54321", &addr_hints, &ers_server);
   if (ret != 0) {
@@ -557,32 +806,22 @@ Peer find_peer(int sock, Endpoint my_endpoint, int id) {
 
   char req[128];
   int req_len = snprintf(req, sizeof(req), "REGISTER %d\n%s:%u", id, ip_string, my_endpoint.port);
-  sendto(
-      sock,
-      req,
-      req_len,
-      0,
-      ers_server->ai_addr,
-      ers_server->ai_addrlen
-  );
+  add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
 
   req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
-  sendto(
-      sock,
-      req,
-      req_len,
-      0,
-      ers_server->ai_addr,
-      ers_server->ai_addrlen
-  );
+  add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
 
   Peer peer = {0};
   bool found_peer = false;
   while(!found_peer) {
-    char buf[1000];
-    ssize_t bytes_recv = recvfrom(sock, &buf, sizeof(buf) - 1, 0, NULL, NULL); 
-    buf[bytes_recv] = 0;
-    char *buf_ptr = buf;
+    UDPPacket udp_packet;
+    int ret = take_from_reader(reader_ring, &udp_packet);
+    if (ret == -1) continue;
+    char *buf_ptr = (char*)udp_packet.buf;
+
+    int last = udp_packet.len;
+    if (last > MAX_UDP_PACKET_SIZE -1) last = MAX_UDP_PACKET_SIZE - 1;
+    buf_ptr[last] = 0;
 
     char *reply = strsep(&buf_ptr, " ");
     if (strcmp(reply, "ENTRIES") != 0) continue;
@@ -625,14 +864,7 @@ Peer find_peer(int sock, Endpoint my_endpoint, int id) {
 
     if (!found_peer) {
         req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
-        sendto(
-            sock,
-            req,
-            req_len,
-            0,
-            ers_server->ai_addr,
-            ers_server->ai_addrlen
-        );
+        add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
     }
 
   }
@@ -692,18 +924,27 @@ int main(int argc, char **argv) {
   UDPRingBuffer writer_ring = {0};
   writer_ring.data = malloc(sizeof(UDPPacket) * RING_BUFFER_CAP);
   ThreadArgs writer_args = { .ring = &writer_ring, .sock = sock, .should_exit = false };
+  sem_init(&writer_ring.sem, 0, 0);
   pthread_t writer_thread;
   pthread_create(&writer_thread, NULL, writer, &writer_args);
 
-  Peer peer = find_peer(sock, endpoint, id);
+  UDPRingBuffer reader_ring = {0};
+  reader_ring.data = malloc(sizeof(UDPPacket) * RING_BUFFER_CAP);
+  ThreadArgs reader_args = { .ring = &reader_ring, .sock = sock, .should_exit = false };
+  sem_init(&reader_ring.sem, 0, RING_BUFFER_CAP - 1);
+  pthread_t reader_thread;
+  pthread_create(&reader_thread, NULL, reader, &reader_args);
+
+  Peer peer = find_peer(&reader_ring, &writer_ring, sock, endpoint, id);
 
   if (server) {
-      sender(&writer_ring, peer);
+      sender_sm(&reader_ring, &writer_ring, peer);
   } else {
-      client(&writer_ring, peer);
+      client(&reader_ring, &writer_ring, peer);
   }
 
-  writer_args.should_exit = true;
+  atomic_store(&writer_args.should_exit, 1);
+  sem_post(&writer_ring.sem);
   pthread_join(writer_thread, NULL);
 
   close(sock);
