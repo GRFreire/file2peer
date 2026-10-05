@@ -5,7 +5,7 @@
 
 4. [HALF] estimate latency and bandwith (also prevent spamming packets)
 
-5. hole punching
+5. [HALF] hole punching
 
 6. local stun server
 7. cli usage (which file to send, where to save received)

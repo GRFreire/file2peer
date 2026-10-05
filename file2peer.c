@@ -84,7 +84,16 @@ struct addrinfo addr_hints = {
 
 int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
   struct addrinfo *stun_server;
-  int ret = getaddrinfo("stun.l.google.com", "19302", &addr_hints, &stun_server);
+
+  char *stun_addr = "stun.l.google.com";
+  char *stun_addr_env = getenv("STUN_ADDR");
+  if (stun_addr_env != NULL) stun_addr = stun_addr_env;
+
+  char *stun_port = "19302";
+  char *stun_port_env = getenv("STUN_PORT");
+  if (stun_port_env != NULL) stun_port = stun_port_env;
+
+  int ret = getaddrinfo(stun_addr, stun_port, &addr_hints, &stun_server);
   if (ret != 0) {
     fprintf(stderr, "Could not get addrinfo for STUN server\n");
     return -1;
@@ -855,7 +864,16 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
 
 Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock, Endpoint my_endpoint, int id) {
   struct addrinfo *ers_server;
-  int ret = getaddrinfo("127.0.0.1", "54321", &addr_hints, &ers_server);
+
+  char *ers_addr = "ers.grfreire.com";
+  char *ers_addr_env = getenv("ERS_ADDR");
+  if (ers_addr_env != NULL) ers_addr = ers_addr_env;
+
+  char *ers_port = "54321";
+  char *ers_port_env = getenv("ERS_PORT");
+  if (ers_port_env != NULL) ers_port = ers_port_env;
+
+  int ret = getaddrinfo(ers_addr, ers_port, &addr_hints, &ers_server);
   if (ret != 0) {
     fprintf(stderr, "Could not get addrinfo for ers server\n");
     exit(1);
