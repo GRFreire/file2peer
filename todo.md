@@ -1,7 +1,7 @@
 1. [DONE] mutex/lock on the writter
 2. [DONE] add reader thread
 
-3. convert to state machine
+3. [DONE] convert to state machine
 
 4. estimate latency and bandwith (also prevent spamming packets)
 

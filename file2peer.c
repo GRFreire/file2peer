@@ -330,10 +330,25 @@ int take_from_reader(UDPRingBuffer *ring, UDPPacket *packet) {
     return -1;
   }
 
-  *packet = ring->data[tail];
+  if (packet != NULL) {
+    *packet = ring->data[tail];
+  }
 
   atomic_store(&ring->tail, (tail + 1) % RING_BUFFER_CAP);
   sem_post(&ring->sem);
+  return 0;
+}
+
+int peek_from_reader(UDPRingBuffer *ring, UDPPacket *packet) {
+  int tail = atomic_load(&ring->tail);
+  int head = atomic_load(&ring->head);
+
+
+  if (head == tail) {
+    return -1;
+  }
+
+  *packet = ring->data[tail];
   return 0;
 }
 
@@ -478,6 +493,7 @@ typedef enum {
   S_SEND_PACKET,
   S_SHOULD_CLOSE,
   S_CLOSING_CONNECTION,
+  S_CLOSE_FILE,
   S_CLOSED_SHOULD_EXIT
 } SM_Sender;
 
@@ -488,6 +504,9 @@ double seconds_since_unspecified_epoch(void) {
 
   return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
 }
+
+// TODO: this should be dynamically calculated to account for diferent latencies
+#define PACKET_RETRY_INTERVAL_SECONDS 0.5
 
 void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
   SM_Sender state = S_UNCONNECTED;
@@ -528,8 +547,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
         }
 
         double now = seconds_since_unspecified_epoch();
-        // TODO: 1 should be a define, and also the time to connect should be used as ping
-        if ((now - last_sent_connect) > 1) {
+        if ((now - last_sent_connect) > PACKET_RETRY_INTERVAL_SECONDS) {
           send_connect(writer_ring, peer, 0, 0);
           last_sent_connect = now;
         }
@@ -627,17 +645,21 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
         if (ret == 0) {
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
           if (ph.type == PACK_TYP_CLOSE_ACK) {
-            state = S_CLOSED_SHOULD_EXIT;
+            state = S_CLOSE_FILE;
             break;
           }
         }
 
         double now = seconds_since_unspecified_epoch();
-        // TODO: 1 should be a define, and also the time to connect should be used as ping
-        if ((now - last_sent_close) > 1) {
+        if ((now - last_sent_close) > PACKET_RETRY_INTERVAL_SECONDS) {
           send_close(writer_ring, peer, 0, 0);
           last_sent_close = now;
         }
+      } break;
+
+      case S_CLOSE_FILE: {
+        fclose(fp);
+        state = S_CLOSED_SHOULD_EXIT;
       } break;
 
       case S_CLOSED_SHOULD_EXIT: {
@@ -647,49 +669,130 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
   }
 }
 
-void client(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-    UDPPacket udp_packet;
-    while(take_from_reader(reader_ring, &udp_packet) == -1) {}
-    PacketHeader ph_connect = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-    if (ph_connect.type != PACK_TYP_CONNECT) {
-        printf("did not get connect");;
+typedef enum {
+  R_UNCONNECTED = 0,
+  R_WAITING_CONNECTION_CONFIRMED,
+  R_OPEN_FILE,
+  R_READ_DATA,
+  R_SEND_CLOSE_ACK,
+  R_WAITING_TO_CLOSE,
+  R_CLOSE_FILE,
+  R_CLOSED_SHOULD_EXIT
+} SM_Receiver;
+
+void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
+  SM_Receiver state = R_UNCONNECTED;
+
+  FILE *fp;
+
+  double last_sent_close_ack;
+
+  while (state != R_CLOSED_SHOULD_EXIT) {
+    switch(state) {
+      case R_UNCONNECTED: {
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+        if (ret == -1) break;
+
+        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+        if (ph.type != PACK_TYP_CONNECT) break;
+
+        send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+        state = R_WAITING_CONNECTION_CONFIRMED;
+      } break;
+
+      case R_WAITING_CONNECTION_CONFIRMED: {
+        UDPPacket udp_packet;
+        int ret = peek_from_reader(reader_ring, &udp_packet);
+        if (ret == -1) break;
+
+        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+        if (ph.type == PACK_TYP_CONNECT) {
+          ret = take_from_reader(reader_ring, NULL);
+          assert (ret == 0);
+
+          send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+          break;
+        }
+
+        if (ph.type == PACK_TYP_DATA) {
+          state = R_OPEN_FILE;
+          break;
+        }
+
+        // other packet type
+        ret = take_from_reader(reader_ring, NULL);
+
+      } break;
+
+      case R_OPEN_FILE: {
+        fp = fopen("./recv_image.jpg", "wb");
+        fseek(fp, 0, SEEK_SET);
+        state = R_READ_DATA;
+      } break;
+
+      case R_READ_DATA: {
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+
+        if (ret == -1) break;
+
+        void *data;
+        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, &data);
+
+        if (ph.type == PACK_TYP_CLOSE) {
+          state = R_SEND_CLOSE_ACK;
+          break;
+        }
+
+        if (ph.type == PACK_TYP_DATA) {
+          fseek(fp, ph.offset, SEEK_SET);
+          fwrite(data, 1, ph.length, fp);
+          send_data_ack(writer_ring, peer, ph.offset, ph.length);
+          break;
+        }
+
+      } break;
+
+      case R_SEND_CLOSE_ACK: {
+        send_ack(writer_ring, peer, PACK_TYP_CLOSE_ACK, 0, 0);
+        last_sent_close_ack = seconds_since_unspecified_epoch();
+        state = R_WAITING_TO_CLOSE;
+      } break;
+
+      case R_WAITING_TO_CLOSE: {
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+
+        if (ret != -1) {
+          PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+
+          if (ph.type == PACK_TYP_CLOSE) {
+            state = R_SEND_CLOSE_ACK;
+            break;
+          }
+        }
+
+        double now = seconds_since_unspecified_epoch();
+
+        if ((now - last_sent_close_ack) > 3 * PACKET_RETRY_INTERVAL_SECONDS) {
+          state = R_CLOSE_FILE;
+          break;
+        }
+
+      } break;
+
+      case R_CLOSE_FILE: {
+        fflush(fp);
+        fclose(fp);
+        state = R_CLOSED_SHOULD_EXIT;
+      } break;
+
+      case R_CLOSED_SHOULD_EXIT: {
+        assert(false && "unreachable. state is exit conditon from while");
+      } break;
     }
-
-    send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
-
-    FILE *fp = fopen("./recv_image.jpg", "wb");
-    fseek(fp, 0, SEEK_SET);
-    bool should_exit = false;
-    while (!should_exit) {
-      int ret = take_from_reader(reader_ring, &udp_packet);
-      if (ret == -1) {
-        continue;
-      }
-
-      void *data;
-      PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, &data);
-
-      switch (ph.type) {
-          case PACK_TYP_CLOSE: {
-            printf("got close\n");
-            send_ack(writer_ring, peer, PACK_TYP_CLOSE_ACK, 0, 0);
-            send_ack(writer_ring, peer, PACK_TYP_CLOSE_ACK, 0, 0);
-            should_exit = true;
-          } break;
-
-          case PACK_TYP_DATA: {
-            fseek(fp, ph.offset, SEEK_SET);
-            fwrite(data, 1, ph.length, fp);
-            send_data_ack(writer_ring, peer, ph.offset, ph.length);
-          } break;
-
-          default:
-              break;
-      }
-
-    }
-
-    fflush(fp);
+  }
 }
 
 Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock, Endpoint my_endpoint, int id) {
@@ -842,7 +945,7 @@ int main(int argc, char **argv) {
   if (server) {
       sender(&reader_ring, &writer_ring, peer);
   } else {
-      client(&reader_ring, &writer_ring, peer);
+      receiver(&reader_ring, &writer_ring, peer);
   }
 
   atomic_store(&writer_args.should_exit, 1);
