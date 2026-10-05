@@ -3,7 +3,7 @@
 
 3. [DONE] convert to state machine
 
-4. estimate latency and bandwith (also prevent spamming packets)
+4. [HALF] estimate latency and bandwith (also prevent spamming packets)
 
 5. hole punching
 

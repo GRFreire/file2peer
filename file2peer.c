@@ -222,7 +222,7 @@ typedef struct {
   uint8_t buf[MAX_UDP_PACKET_SIZE];
 } UDPPacket;
 
-#define RING_BUFFER_CAP 102400
+#define RING_BUFFER_CAP 1024
 typedef struct {
   _Atomic int head;
   _Atomic int tail;
@@ -481,6 +481,7 @@ PacketHeader parse_packet(void *packet, size_t packet_len, void **data) {
 typedef struct {
     uint32_t offset;
     uint32_t length;
+    double last_sent;
     bool confirmed;
 } PacketTracker;
 
@@ -520,8 +521,6 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
   uint8_t file_buffer[BLOCK_SIZE];
   PacketTracker tracker[PACKS_PER_BLOCK] = {0};
   int tracker_len = 0;
-
-  int packet_sending_idx = 0;
 
   double last_sent_close;
 
@@ -576,43 +575,43 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
           tracker[i] = (PacketTracker){
             .offset = offset,
             .length = length,
+            .last_sent = 0,
             .confirmed = false,
           };
         }
-
-        packet_sending_idx = 0;
 
         state = S_SEND_PACKET;
       } break;
 
       case S_SEND_PACKET: {
-        // TODO: each packet should have its own time when it was sent.
-        // Then, in this state, send all packets where enought time has
-        // passed. This eliminates the "static" state packet_sending_idx
-        // and implements sort of a rate limiting on the sending side.
+        bool has_unconfirmed_packets = false;
+        double now = seconds_since_unspecified_epoch();
+        int packets_sent_this_iteration = 0;
+        for (int i = 0; i < tracker_len; i++) {
+          if (tracker[i].confirmed) continue;
+          has_unconfirmed_packets = true;
 
-        int i;
-        for (i = packet_sending_idx; i < tracker_len && tracker[i].confirmed; i++) {}
+          if ((now - tracker[i].last_sent) > PACKET_RETRY_INTERVAL_SECONDS) {
+            PacketTracker t = tracker[i];
+            int ret = send_data(writer_ring, peer, file_offset + t.offset, t.length, &file_buffer[t.offset]);
 
-        if (i < tracker_len && !tracker[i].confirmed) {
-          packet_sending_idx++;
-          PacketTracker t = tracker[i];
-          send_data(writer_ring, peer, file_offset + t.offset, t.length, &file_buffer[t.offset]);
+            if (ret == -1) {
+              break;
+            }
 
-          state = S_HANDLE_ACKS;
+            tracker[i].last_sent = now;
+
+            packets_sent_this_iteration++;
+            if (packets_sent_this_iteration > 8) break;
+          }
+        }
+
+        if (!has_unconfirmed_packets) {
+          state = S_CREATE_NEW_BLOCK;
           break;
         }
 
-        for (i = 0; i < packet_sending_idx && tracker[i].confirmed; i++) {}
-
-        if (!tracker[i].confirmed) {
-          packet_sending_idx = i;
-
-          state = S_HANDLE_ACKS;
-          break;
-        }
-
-        state = S_CREATE_NEW_BLOCK;
+        state = S_HANDLE_ACKS;
       } break;
 
       case S_HANDLE_ACKS: {
