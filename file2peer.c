@@ -489,7 +489,7 @@ double seconds_since_unspecified_epoch(void) {
   return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
 }
 
-void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
+void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
   SM_Sender state = S_UNCONNECTED;
 
   double last_sent_connect;
@@ -509,7 +509,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
   while(state != S_CLOSED_SHOULD_EXIT) {
     switch(state) {
       case S_UNCONNECTED: {
-        printf("STATE: S_UNCONNECTED\n");
         send_connect(writer_ring, peer, 0, 0);
         last_sent_connect = seconds_since_unspecified_epoch();
 
@@ -517,7 +516,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
       
       case S_WAITING_CONNECTION: {
-        printf("STATE: S_WAITING_CONNECTION\n");
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
 
@@ -538,13 +536,11 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_OPEN_FILE: {
-        printf("STATE: S_OPEN_FILE\n");
         fp = fopen("./image.jpg", "rb");
         state = S_CREATE_NEW_BLOCK;
       } break;
 
       case S_CREATE_NEW_BLOCK: {
-        printf("STATE: S_CREATE_NEW_BLOCK\n");
         file_offset = file_next_offset;
         int len = fread(file_buffer, 1, BLOCK_SIZE, fp);
         if (len == 0) {
@@ -572,8 +568,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_SEND_PACKET: {
-        printf("STATE: S_SEND_PACKET\n");
-
         // TODO: each packet should have its own time when it was sent.
         // Then, in this state, send all packets where enought time has
         // passed. This eliminates the "static" state packet_sending_idx
@@ -604,7 +598,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_HANDLE_ACKS: {
-        printf("STATE: S_HANDLE_ACKS\n");
         UDPPacket udp_packet;
         while(take_from_reader(reader_ring, &udp_packet) != -1) {
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
@@ -621,7 +614,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_SHOULD_CLOSE: {
-        printf("STATE: S_SHOULD_CLOSE\n");
         send_close(writer_ring, peer, 0, 0);
         last_sent_close = seconds_since_unspecified_epoch();
 
@@ -629,7 +621,6 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_CLOSING_CONNECTION: {
-        printf("STATE: S_CLOSING_CONNECTION\n");
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
 
@@ -650,99 +641,10 @@ void sender_sm(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer
       } break;
 
       case S_CLOSED_SHOULD_EXIT: {
-        printf("STATE: S_CLOSED_SHOULD_EXIT\n");
         assert(false && "unreachable. state is exit conditon from while");
       } break;
     }
   }
-}
-
-void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-    send_connect(writer_ring, peer, 0, 0);
-
-    UDPPacket udp_packet;
-    while(take_from_reader(reader_ring, &udp_packet) == -1) {}
-    PacketHeader ph_ack = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-    if (ph_ack.type != PACK_TYP_CONNECT_ACK) {
-        printf("did not get ack");;
-    }
-
-    FILE *fp = fopen("./image.jpg", "rb");
-
-    uint32_t filebuffer_offset = 0;
-    uint32_t filebuffer_offset_next = 0;
-    uint8_t filebuffer[BLOCK_SIZE];
-    PacketTracker pt[PACKS_PER_BLOCK] = {0};
-    int pt_idx = 0;
-    int pt_cap = 0;
-    bool exit = false;
-    while (!exit) {
-
-        // HANDLE ACKS AND PACKETS RECEIVED
-        while(take_from_reader(reader_ring, &udp_packet) != -1) {
-            PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-            if (ph.type == PACK_TYP_DATA_ACK) {
-                for (int i = 0; i < pt_idx; i++) {
-                    if (pt[i].offset + filebuffer_offset == ph.offset) {
-                        pt[i].confirmed = true;
-                    }
-                }
-            }
-        }
-
-        // CHECK IF NEW BLOCK IS NEEDED
-        bool should_new_block = true;
-        for (int i = 0; i < pt_idx; i++) {
-            if (!pt[i].confirmed) {
-                should_new_block = false;
-                break;
-            }
-        }
-        if (pt_idx < pt_cap) should_new_block = false;
-
-        // MOVE TO NEW BLOCK
-        if (should_new_block) {
-            printf("new block\n");
-            filebuffer_offset = filebuffer_offset_next;
-            int len = fread(filebuffer, 1, BLOCK_SIZE, fp);
-            if (len == 0) {
-                exit = true;
-                break;
-            }
-            filebuffer_offset_next += len;
-            pt_idx = 0;
-            pt_cap = (len + MAX_PACKET_PAYLOAD_SIZE - 1) / MAX_PACKET_PAYLOAD_SIZE;
-        }
-
-        // CREATE NEW PACKET TRACKER
-        if (pt_idx < pt_cap) {
-            uint32_t offset = pt_idx * MAX_PACKET_PAYLOAD_SIZE;
-            uint32_t remaining = filebuffer_offset_next - filebuffer_offset - offset;
-            uint32_t length = (remaining > MAX_PACKET_PAYLOAD_SIZE) ? MAX_PACKET_PAYLOAD_SIZE : remaining;
-            pt[pt_idx] = (PacketTracker){
-                .offset = offset,
-                .length = length,
-                .confirmed = false,
-            };
-            pt_idx++;
-        }
-
-        // SEND UNCONFIRMED PACKETS
-        for (int i = 0; i < pt_idx; i++) {
-            if (!pt[i].confirmed) {
-                send_data(writer_ring, peer, pt[i].offset + filebuffer_offset, pt[i].length, filebuffer + pt[i].offset);
-
-                struct timespec ts = {
-                  .tv_sec = 0,
-                  .tv_nsec = 10,
-                };
-
-                nanosleep(&ts, &ts);
-                }
-            }
-        }
-
-    send_close(writer_ring, peer, 0, 0);
 }
 
 void client(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
@@ -938,7 +840,7 @@ int main(int argc, char **argv) {
   Peer peer = find_peer(&reader_ring, &writer_ring, sock, endpoint, id);
 
   if (server) {
-      sender_sm(&reader_ring, &writer_ring, peer);
+      sender(&reader_ring, &writer_ring, peer);
   } else {
       client(&reader_ring, &writer_ring, peer);
   }
