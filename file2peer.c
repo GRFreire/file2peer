@@ -60,6 +60,22 @@ void print_endpoint(Endpoint endpoint) {
   printf("Endpoint: %s:%u\n", ip_string, endpoint.port);
 }
 
+void print_addr(const char *label, const struct sockaddr *addr) {
+  if (addr == NULL) {
+    printf("%s: (null)\n", label);
+    return;
+  }
+
+  if (addr->sa_family == AF_INET) {
+    const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+    printf("%s: %s:%u\n", label, ip, ntohs(in->sin_port));
+  } else {
+    printf("%s: unsupported family %d\n", label, addr->sa_family);
+  }
+}
+
 struct addrinfo addr_hints = {
   .ai_family   = AF_INET,
   .ai_socktype = SOCK_DGRAM,
@@ -217,8 +233,9 @@ int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
 #define MAX_UDP_PACKET_SIZE 1500
 typedef struct {
   size_t len;
-  struct sockaddr *dest_addr;
+  struct sockaddr *addr;
   socklen_t addrlen;
+  struct sockaddr_storage addr_storage;
   uint8_t buf[MAX_UDP_PACKET_SIZE];
 } UDPPacket;
 
@@ -251,11 +268,11 @@ void *writer(void *arg) {
       pthread_exit(NULL);
     }
 
-    UDPPacket p = ring->data[tail];
+    UDPPacket *p = &ring->data[tail];
     tail++;
     tail %= RING_BUFFER_CAP;
 
-    sendto(args->sock, &p.buf, p.len, 0, p.dest_addr, p.addrlen);
+    sendto(args->sock, &p->buf, p->len, 0, p->addr, p->addrlen);
 
     atomic_store(&ring->tail, tail);
   }
@@ -275,9 +292,13 @@ int add_to_writer(UDPRingBuffer *ring, void *buf, size_t len, struct sockaddr *d
 
   UDPPacket *p = &ring->data[head];
   p->len = len;
-  p->dest_addr = dest_addr;
-  p->addrlen = addrlen;
   memcpy(p->buf, buf, len);
+
+  assert(dest_addr != NULL);
+  p->addrlen = addrlen;
+  if (p->addrlen > sizeof(p->addr_storage)) p->addrlen = sizeof(p->addr_storage);
+  memcpy(&p->addr_storage, dest_addr, p->addrlen);
+  p->addr = (struct sockaddr *)&p->addr_storage;
 
   atomic_store(&ring->head, new_head);
   sem_post(&ring->sem);
@@ -305,15 +326,17 @@ void *reader(void *arg) {
     }
 
     UDPPacket *p = &ring->data[head];
-    ssize_t bytes_recv = recvfrom(args->sock, &p->buf, MAX_UDP_PACKET_SIZE, 0, NULL, NULL); 
+    p->addrlen = sizeof(p->addr_storage);
+    ssize_t bytes_recv = recvfrom(args->sock, &p->buf, MAX_UDP_PACKET_SIZE, 0,
+                                  (struct sockaddr *)&p->addr_storage, &p->addrlen); 
+
     if (bytes_recv == (ssize_t)-1) {
       sem_post(&ring->sem);
       continue;
     }
 
     p->len = bytes_recv;
-    p->dest_addr = NULL;
-    p->addrlen = 0;
+    p->addr = (struct sockaddr *)&p->addr_storage;
 
     atomic_store(&ring->head, new_head);
   }
@@ -332,6 +355,7 @@ int take_from_reader(UDPRingBuffer *ring, UDPPacket *packet) {
 
   if (packet != NULL) {
     *packet = ring->data[tail];
+    packet->addr = (struct sockaddr *)&packet->addr_storage;
   }
 
   atomic_store(&ring->tail, (tail + 1) % RING_BUFFER_CAP);
@@ -348,8 +372,35 @@ int peek_from_reader(UDPRingBuffer *ring, UDPPacket *packet) {
     return -1;
   }
 
-  *packet = ring->data[tail];
+  if (packet != NULL) {
+    *packet = ring->data[tail];
+    packet->addr = (struct sockaddr *)&packet->addr_storage;
+  }
+
   return 0;
+}
+
+int addr_cmp(struct sockaddr *a, struct sockaddr *b) {
+  if (a == NULL || b == NULL) return 1;
+
+  if (a->sa_family != b->sa_family) return 1;
+  if (a->sa_family != AF_INET)      return 1;
+
+  struct sockaddr_in *a_in = (struct sockaddr_in *)a;
+  struct sockaddr_in *b_in = (struct sockaddr_in *)b;
+
+  if (a_in->sin_addr.s_addr != b_in->sin_addr.s_addr) return 1;
+  if (a_in->sin_port        != b_in->sin_port)        return 1;
+
+  return 0;
+}
+
+#define NANOS_PER_SEC (1000 * 1000 * 1000)
+double seconds_since_unspecified_epoch(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
 }
 
 #define LINE_BUF_SIZE 100
@@ -386,7 +437,7 @@ static_assert(sizeof(PacketHeader) == 12, "packet header struct wrongly packed")
 typedef struct {
     int fd;
     struct sockaddr *addr;
-    socklen_t addr_len;
+    socklen_t addrlen;
 } Peer;
 
 int send_ack(UDPRingBuffer *packet_ring, Peer peer, PacketType type, uint32_t id, uint32_t ack_id) {
@@ -398,7 +449,7 @@ int send_ack(UDPRingBuffer *packet_ring, Peer peer, PacketType type, uint32_t id
         .ack_id = ack_id,
     };
 
-    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addrlen);
 }
 int send_connect(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
     PacketHeader p = {
@@ -409,7 +460,7 @@ int send_connect(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ac
         .ack_id = ack_id,
     };
 
-    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addrlen);
 }
 int send_close(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_id) {
     PacketHeader p = {
@@ -420,7 +471,7 @@ int send_close(UDPRingBuffer *packet_ring, Peer peer, uint32_t id, uint32_t ack_
         .ack_id = ack_id,
     };
 
-    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addrlen);
 }
 int send_data(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length, void *data) {
     assert(length <= MAX_PACKET_PAYLOAD_SIZE);
@@ -436,7 +487,7 @@ int send_data(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t l
     memcpy(&buffer[0], &p, sizeof(p));
     memcpy(&buffer[sizeof(p)], data, length);
 
-    return add_to_writer(packet_ring, buffer, sizeof(PacketHeader) + length, peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, buffer, sizeof(PacketHeader) + length, peer.addr, peer.addrlen);
 }
 int send_data_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32_t length) {
     PacketHeader p = {
@@ -447,7 +498,7 @@ int send_data_ack(UDPRingBuffer *packet_ring, Peer peer, uint32_t offset, uint32
         .length = length,
     };
 
-    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addr_len);
+    return add_to_writer(packet_ring, &p, sizeof(p), peer.addr, peer.addrlen);
 }
 
 PacketHeader parse_packet(void *packet, size_t packet_len, void **data) {
@@ -486,8 +537,7 @@ typedef struct {
 } PacketTracker;
 
 typedef enum {
-  S_UNCONNECTED = 0,
-  S_WAITING_CONNECTION,
+  S_WAITING_CONNECTION = 0,
   S_OPEN_FILE,
   S_CREATE_NEW_BLOCK,
   S_HANDLE_ACKS,
@@ -498,21 +548,13 @@ typedef enum {
   S_CLOSED_SHOULD_EXIT
 } SM_Sender;
 
-#define NANOS_PER_SEC (1000 * 1000 * 1000)
-double seconds_since_unspecified_epoch(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-
-  return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
-}
-
 // TODO: this should be dynamically calculated to account for diferent latencies
 #define PACKET_RETRY_INTERVAL_SECONDS 0.5
 
 void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-  SM_Sender state = S_UNCONNECTED;
+  SM_Sender state = S_WAITING_CONNECTION;
 
-  double last_sent_connect;
+  double last_sent_connect = 0;
 
   FILE *fp;
 
@@ -522,25 +564,29 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
   PacketTracker tracker[PACKS_PER_BLOCK] = {0};
   int tracker_len = 0;
 
-  double last_sent_close;
+  double last_sent_close = 0;
 
+  double last_printed_state = 0;
   while(state != S_CLOSED_SHOULD_EXIT) {
-    switch(state) {
-      case S_UNCONNECTED: {
-        send_connect(writer_ring, peer, 0, 0);
-        last_sent_connect = seconds_since_unspecified_epoch();
+    double now = seconds_since_unspecified_epoch();
+    if ((now - last_printed_state) > 1) {
+      last_printed_state = now;
+      printf("State = %d\n", state);
+    }
 
-        state = S_WAITING_CONNECTION;
-      } break;
-      
+    switch(state) {
       case S_WAITING_CONNECTION: {
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
-
-        if (ret == 0) {
+        if (ret == 0 && addr_cmp(udp_packet.addr, peer.addr) == 0) {
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
           if (ph.type == PACK_TYP_CONNECT_ACK) {
             state = S_OPEN_FILE;
+            break;
+          }
+
+          if (ph.type == PACK_TYP_CONNECT) {
+            send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
             break;
           }
         }
@@ -617,6 +663,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
       case S_HANDLE_ACKS: {
         UDPPacket udp_packet;
         while(take_from_reader(reader_ring, &udp_packet) != -1) {
+          if (addr_cmp(udp_packet.addr, peer.addr) != 0) continue;
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
           if (ph.type == PACK_TYP_DATA_ACK) {
             for (int i = 0; i < tracker_len; i++) {
@@ -641,7 +688,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
 
-        if (ret == 0) {
+        if (ret == 0 && addr_cmp(udp_packet.addr, peer.addr) == 0) {
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
           if (ph.type == PACK_TYP_CLOSE_ACK) {
             state = S_CLOSE_FILE;
@@ -669,8 +716,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
 }
 
 typedef enum {
-  R_UNCONNECTED = 0,
-  R_WAITING_CONNECTION_CONFIRMED,
+  R_WAITING_CONNECTION = 0,
   R_OPEN_FILE,
   R_READ_DATA,
   R_SEND_CLOSE_ACK,
@@ -680,48 +726,62 @@ typedef enum {
 } SM_Receiver;
 
 void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-  SM_Receiver state = R_UNCONNECTED;
+  SM_Receiver state = R_WAITING_CONNECTION;
+
+  double last_sent_connect = 0;
+  bool got_connect_ack = false;
 
   FILE *fp;
 
   double last_sent_close_ack;
 
-  while (state != R_CLOSED_SHOULD_EXIT) {
+  double last_printed_state = 0;
+  while(state != R_CLOSED_SHOULD_EXIT) {
+    double now = seconds_since_unspecified_epoch();
+    if ((now - last_printed_state) > 1) {
+      last_printed_state = now;
+      printf("State = %d\n", state);
+    }
+
     switch(state) {
-      case R_UNCONNECTED: {
-        UDPPacket udp_packet;
-        int ret = take_from_reader(reader_ring, &udp_packet);
-        if (ret == -1) break;
+      case R_WAITING_CONNECTION: {
+        if (!got_connect_ack) {
+          double now = seconds_since_unspecified_epoch();
+          if ((now - last_sent_connect) > PACKET_RETRY_INTERVAL_SECONDS) {
+            send_connect(writer_ring, peer, 0, 0);
+            last_sent_connect = now;
+          }
+        }
 
-        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-        if (ph.type != PACK_TYP_CONNECT) break;
-
-        send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
-        state = R_WAITING_CONNECTION_CONFIRMED;
-      } break;
-
-      case R_WAITING_CONNECTION_CONFIRMED: {
         UDPPacket udp_packet;
         int ret = peek_from_reader(reader_ring, &udp_packet);
-        if (ret == -1) break;
+        if (ret != 0) break;
 
-        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-        if (ph.type == PACK_TYP_CONNECT) {
-          ret = take_from_reader(reader_ring, NULL);
-          assert (ret == 0);
-
-          send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+        if (addr_cmp(udp_packet.addr, peer.addr) != 0) {
+          print_addr("dropped, got ", udp_packet.addr);
+          print_addr("        want", peer.addr);
+          take_from_reader(reader_ring, NULL);
           break;
         }
 
+        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
         if (ph.type == PACK_TYP_DATA) {
           state = R_OPEN_FILE;
           break;
         }
 
-        // other packet type
         ret = take_from_reader(reader_ring, NULL);
+        assert(ret == 0);
 
+        if (ph.type == PACK_TYP_CONNECT) {
+          send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+          break;
+        }
+
+        if (ph.type == PACK_TYP_CONNECT_ACK) {
+          got_connect_ack = true;
+          break;
+        }
       } break;
 
       case R_OPEN_FILE: {
@@ -733,8 +793,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
       case R_READ_DATA: {
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
-
-        if (ret == -1) break;
+        if (ret != 0 || addr_cmp(udp_packet.addr, peer.addr) != 0) break;
 
         void *data;
         PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, &data);
@@ -763,7 +822,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
 
-        if (ret != -1) {
+        if (ret != -1 && addr_cmp(udp_packet.addr, peer.addr) == 0) {
           PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
 
           if (ph.type == PACK_TYP_CLOSE) {
@@ -796,7 +855,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
 
 Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock, Endpoint my_endpoint, int id) {
   struct addrinfo *ers_server;
-  int ret = getaddrinfo("0.0.0.0", "54321", &addr_hints, &ers_server);
+  int ret = getaddrinfo("127.0.0.1", "54321", &addr_hints, &ers_server);
   if (ret != 0) {
     fprintf(stderr, "Could not get addrinfo for ers server\n");
     exit(1);
@@ -812,15 +871,29 @@ Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock,
   int req_len = snprintf(req, sizeof(req), "REGISTER %d\n%s:%u", id, ip_string, my_endpoint.port);
   add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
 
+  double last_sent_query = seconds_since_unspecified_epoch();
   req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
   add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
 
   Peer peer = {0};
   bool found_peer = false;
   while(!found_peer) {
+    double now = seconds_since_unspecified_epoch();
+    if ((now - last_sent_query) > 2 * PACKET_RETRY_INTERVAL_SECONDS) {
+      req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
+      add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
+      last_sent_query = now;
+    }
+
     UDPPacket udp_packet;
     int ret = take_from_reader(reader_ring, &udp_packet);
     if (ret == -1) continue;
+    if (addr_cmp(udp_packet.addr, ers_server->ai_addr) != 0) {
+      print_addr("ERS dropped, got ", udp_packet.addr);
+      print_addr("           want", ers_server->ai_addr);
+      continue;
+    }
+
     char *buf_ptr = (char*)udp_packet.buf;
 
     int last = udp_packet.len;
@@ -857,7 +930,7 @@ Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock,
         peer = (Peer){
             .fd = sock,
             .addr = peer_addr->ai_addr,
-            .addr_len = peer_addr->ai_addrlen,
+            .addrlen = peer_addr->ai_addrlen,
         };
 
         found_peer = true;
@@ -865,19 +938,14 @@ Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock,
         printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
         break;
     }
-
-    if (!found_peer) {
-        req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
-        add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
-    }
-
   }
 
   return peer;
 }
 
 
-#define LOCAL 1
+#define LOCAL 0
+
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -901,6 +969,7 @@ int main(int argc, char **argv) {
   int res;
   if (LOCAL) {
     res = get_socket_local_endpoint(sock, &endpoint);
+    endpoint.addr = INADDR_LOOPBACK;
   } else {
     res = get_socket_public_endpoint(sock, &endpoint);
   }
