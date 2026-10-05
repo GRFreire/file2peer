@@ -52,6 +52,12 @@ int main(int argc, char **argv) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
     int port = 54321;
+    char *env_port_str = getenv("ERS_PORT");
+    if (env_port_str != NULL) {
+      int env_port = atoi(env_port_str);
+      if (env_port > 0) port = env_port;
+    }
+
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;  // all local interfaces
