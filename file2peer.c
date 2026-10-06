@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <assert.h>
-#include <errno.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -15,6 +14,14 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#define NANOS_PER_SEC (1000 * 1000 * 1000)
+double seconds_since_unspecified_epoch(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+
+  return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
+}
 
 #define STUN_MAGIC_COOKIE 0x2112A442
 #define STUN_BINDING_REQUEST 0x0001
@@ -82,6 +89,9 @@ struct addrinfo addr_hints = {
   .ai_flags    = AI_NUMERICSERV
 };
 
+#define STUN_RETRY_INTERVAL 0.5
+#define STUN_MAX_TRY_TIME 2
+
 int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
   struct addrinfo *stun_server;
 
@@ -95,7 +105,7 @@ int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
 
   int ret = getaddrinfo(stun_addr, stun_port, &addr_hints, &stun_server);
   if (ret != 0) {
-    fprintf(stderr, "Could not get addrinfo for STUN server\n");
+    // fprintf(stderr, "Could not get addrinfo for STUN server\n");
     return -1;
   }
 
@@ -107,107 +117,120 @@ int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
   };
   getrandom(req_header.transaction_id, 12, 0);
 
-  ret = sendto(sock, &req_header, sizeof(req_header), 0, stun_server->ai_addr, stun_server->ai_addrlen);
-  if (ret == -1) {
-    fprintf(stderr, "Could not send data to STUN server: %s\n", strerror(errno));
-    freeaddrinfo(stun_server);
-    return -1;
+  uint8_t response[STUN_BUFFER_SIZE];
+  ssize_t bytes_recv = 0;
+
+  double started_trying = seconds_since_unspecified_epoch();
+  double last_sent = 0;
+  while (true) {
+    double now = seconds_since_unspecified_epoch();
+
+    if ((now - last_sent) > STUN_RETRY_INTERVAL) {
+      ret = sendto(sock, &req_header, sizeof(req_header), 0, stun_server->ai_addr, stun_server->ai_addrlen);
+      if (ret != -1) {
+        last_sent = now;
+      }
+    }
+
+    if ((now - started_trying) > STUN_MAX_TRY_TIME) {
+      break;
+    }
+
+    bytes_recv = recvfrom(sock, &response, sizeof(response), MSG_DONTWAIT, NULL, NULL);
+    if (bytes_recv == -1) {
+      struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+      nanosleep(&ts, NULL);
+    } else if ((size_t)bytes_recv < sizeof(stun_header)) {
+      // fprintf(stderr, "Not enought data received to parse STUN header.\n");
+    } else {
+      size_t offset = 0;
+      stun_header res_header;
+      memcpy(&res_header, &response[offset], sizeof(res_header));
+      offset += sizeof(stun_header);
+
+      res_header.type   = ntohs(res_header.type);
+      res_header.length = ntohs(res_header.length);
+      res_header.cookie = ntohl(res_header.cookie);
+
+      if (res_header.cookie != STUN_MAGIC_COOKIE) {
+        // fprintf(stderr, "Wrong magic cookie\n");
+        continue;
+      }
+
+      if (res_header.type != STUN_BINDING_SUCCESS_RESPONSE) {
+        // fprintf(stderr, "Not a successful Stun Binding Response\n");
+        continue;
+      }
+
+      if (memcmp(req_header.transaction_id, res_header.transaction_id, sizeof(req_header.transaction_id)) != 0) {
+        // fprintf(stderr, "Wrong transaction id\n");
+        continue;
+      }
+
+      if ((size_t)bytes_recv < res_header.length + sizeof(stun_header)) {
+        // fprintf(stderr, "Could not read enough data to parse entire response\n");
+        continue;
+      }
+
+      Endpoint endpoint = {0};
+      bool found = false;
+      while (offset + sizeof(stun_tlv) <= (size_t)res_header.length + sizeof(stun_header)) {
+        stun_tlv tlv;
+        memcpy(&tlv, &response[offset], sizeof(tlv));
+        offset += sizeof(stun_tlv);
+
+        tlv.type   = ntohs(tlv.type);
+        tlv.length = ntohs(tlv.length);
+
+        // always 4-bytes aligned
+        size_t next_attr_offset = (tlv.length + 3) & ~3;
+
+        if (offset + tlv.length > (size_t)res_header.length + sizeof(stun_header)) {
+          // not enought data read to parse tlv
+          break;
+        }
+
+        if (tlv.type != STUN_XOR_MAPPED_ADDRESS) {
+          // not xor-mapped address, skipping
+          offset += next_attr_offset;
+          continue;
+        }
+
+        if (tlv.length < 8) {
+          // invalid, skipping
+          offset += next_attr_offset;
+          continue;
+        }
+
+        stun_xor_mapped_addr addr;
+        memcpy(&addr, &response[offset], sizeof(addr));
+        offset += next_attr_offset;
+
+        if (addr.family != STUN_IPV4_FAMILY) {
+          // not ipv4, skipping
+          continue;
+        }
+
+        endpoint.port = ntohs(addr.xor_port) ^ (STUN_MAGIC_COOKIE >> 16);
+        endpoint.addr = ntohl(addr.xor_addr) ^ (STUN_MAGIC_COOKIE);
+        found = true;
+        break;
+      }
+
+      if (!found) {
+        // fprintf(stderr, "Could not find any IPv4 response\n");
+        continue;
+      }
+
+      *out_endpoint = endpoint;
+      freeaddrinfo(stun_server);
+      return 0;
+    }
   }
 
   freeaddrinfo(stun_server);
 
-  uint8_t response[STUN_BUFFER_SIZE];
-  ssize_t bytes_recv = recvfrom(sock, &response, sizeof(response), 0, NULL, NULL);
-  if (bytes_recv == -1) {
-    fprintf(stderr, "Could not receive data: %s\n", strerror(errno));
-    return -1;
-  } else if ((size_t)bytes_recv < sizeof(stun_header)) {
-    fprintf(stderr, "Not enought data received to parse STUN header. Needed %ld, got %ld\n",
-            sizeof(stun_header), bytes_recv);
-    return -1;
-  }
-
-  size_t offset = 0;
-  stun_header res_header;
-  memcpy(&res_header, &response[offset], sizeof(res_header));
-  offset += sizeof(stun_header);
-
-  res_header.type   = ntohs(res_header.type);
-  res_header.length = ntohs(res_header.length);
-  res_header.cookie = ntohl(res_header.cookie);
-
-  if (res_header.cookie != STUN_MAGIC_COOKIE) {
-    fprintf(stderr, "Wrong magic cookie\n");
-    return -1;
-  }
-
-  if (res_header.type != STUN_BINDING_SUCCESS_RESPONSE) {
-    fprintf(stderr, "Not a successful Stun Binding Response\n");
-    return -1;
-  }
-
-  if (memcmp(req_header.transaction_id, res_header.transaction_id, sizeof(req_header.transaction_id)) != 0) {
-    fprintf(stderr, "Wrong transaction id\n");
-    return -1;
-  }
-
-  if ((size_t)bytes_recv < res_header.length + sizeof(stun_header)) {
-    fprintf(stderr, "Could not read enough data to parse entire response\n");
-    return -1;
-  }
-
-  Endpoint endpoint = {0};
-  bool found = false;
-  while (offset + sizeof(stun_tlv) <= (size_t)res_header.length + sizeof(stun_header)) {
-    stun_tlv tlv;
-    memcpy(&tlv, &response[offset], sizeof(tlv));
-    offset += sizeof(stun_tlv);
-
-    tlv.type   = ntohs(tlv.type);
-    tlv.length = ntohs(tlv.length);
-
-    // always 4-bytes aligned
-    size_t next_attr_offset = (tlv.length + 3) & ~3;
-
-    if (offset + tlv.length > (size_t)res_header.length + sizeof(stun_header)) {
-      // not enought data read to parse tlv
-      break;
-    }
-
-    if (tlv.type != STUN_XOR_MAPPED_ADDRESS) {
-      // not xor-mapped address, skipping
-      offset += next_attr_offset;
-      continue;
-    }
-
-    if (tlv.length < 8) {
-      // invalid, skipping
-      offset += next_attr_offset;
-      continue;
-    }
-
-    stun_xor_mapped_addr stun_addr;
-    memcpy(&stun_addr, &response[offset], sizeof(stun_addr));
-    offset += next_attr_offset;
-
-    if (stun_addr.family != STUN_IPV4_FAMILY) {
-      // not ipv4, skipping
-      continue;
-    }
-
-    endpoint.port = ntohs(stun_addr.xor_port) ^ (STUN_MAGIC_COOKIE >> 16);
-    endpoint.addr = ntohl(stun_addr.xor_addr) ^ (STUN_MAGIC_COOKIE);
-    found = true;
-    break;
-  }
-
-  if (!found) {
-    fprintf(stderr, "Could not find any IPv4 response\n");
-    return -1;
-  }
-
-  *out_endpoint = endpoint;
-  return 0;
+  return -1;
 }
 
 int get_socket_loopback_endpoint(int sock, Endpoint *out_endpoint) {
@@ -432,14 +455,6 @@ int addr_cmp(struct sockaddr *a, struct sockaddr *b) {
   return 0;
 }
 
-#define NANOS_PER_SEC (1000 * 1000 * 1000)
-double seconds_since_unspecified_epoch(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-
-  return (double)(NANOS_PER_SEC * ts.tv_sec + ts.tv_nsec) / NANOS_PER_SEC;
-}
-
 #define LINE_BUF_SIZE 100
 
 typedef enum {
@@ -654,7 +669,6 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
           offset += snprintf(register_ers_req + offset, sizeof(register_ers_req) - offset, "%s:%u\n", ip_string[i], my_endpoints[i].port);
         }
         register_ers_req_len = strlen(register_ers_req);
-        printf("%s\n", register_ers_req);
 
         snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
         expected_ers_response_len = strlen(expected_ers_response);
@@ -1194,6 +1208,8 @@ int main(int argc, char **argv) {
   Endpoint public_endpoint;
   if (get_socket_public_endpoint(sock, &public_endpoint) == 0) {
     my_endpoints[my_endpoints_len++] = public_endpoint;
+  } else {
+    printf("STUN failed, using local endpoints only.\n");
   }
 
   Endpoint loopback_endpoint;
