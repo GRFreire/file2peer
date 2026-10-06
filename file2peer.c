@@ -210,7 +210,7 @@ int get_socket_public_endpoint(int sock, Endpoint *out_endpoint) {
   return 0;
 }
 
-int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
+int get_socket_loopback_endpoint(int sock, Endpoint *out_endpoint) {
   struct sockaddr_in addr;
   socklen_t addr_len = sizeof(addr);
   
@@ -235,6 +235,34 @@ int get_socket_local_endpoint(int sock, Endpoint *out_endpoint) {
   out_endpoint->port = ntohs(addr.sin_port);
   out_endpoint->addr = ntohl(addr.sin_addr.s_addr);
   return 0;
+}
+
+int get_lan_ip() {
+  int tmp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (tmp_sock == -1) return -1;
+
+  struct sockaddr_in dummy_addr = {
+    .sin_family = AF_INET,
+    .sin_port = htons(1)
+  };
+
+  inet_pton(AF_INET, "192.0.2.1", &dummy_addr.sin_addr);
+
+  if (connect(tmp_sock, (struct sockaddr *)&dummy_addr, sizeof(dummy_addr)) == -1) {
+    close(tmp_sock);
+    return -1;
+  }
+
+  struct sockaddr_in my_addr = {0};
+  socklen_t len = sizeof(my_addr);
+  if (getsockname(tmp_sock, (struct sockaddr *)&my_addr, &len) == -1) {
+    close(tmp_sock);
+    return -1;
+  }
+
+  close(tmp_sock);
+
+  return ntohl(my_addr.sin_addr.s_addr);
 }
 
 // ----------------------------------------------
@@ -565,18 +593,18 @@ typedef enum {
 // TODO: this should be dynamically calculated to account for diferent latencies
 #define PACKET_RETRY_INTERVAL_SECONDS 0.5
 
-void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint local_endpoint, Endpoint public_endpoint, int ers_id) {
+void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len, int ers_id) {
   SM_Sender state = S_ERS_SETUP;
 
   struct addrinfo *ers_server;
 
-  char local_ip_string[INET_ADDRSTRLEN];
-  char public_ip_string[INET_ADDRSTRLEN];
-  char register_ers_req[256];
-  int register_ers_req_len;
+  assert(my_endpoints_len <= PEERS_CAP);
+  char ip_string[PEERS_CAP][INET_ADDRSTRLEN];
+  char register_ers_req[32 + 24 * PEERS_CAP];
   char expected_ers_response[256];
-  int expected_ers_response_len;
   char query_ers_req[256];
+  int register_ers_req_len;
+  int expected_ers_response_len;
   int query_ers_req_len;
 
   double last_sent_register = 0;
@@ -617,16 +645,16 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint loc
           exit(1);
         }
 
-        struct in_addr local_ip;
-        local_ip.s_addr = htonl(local_endpoint.addr);
-        inet_ntop(AF_INET, &local_ip, local_ip_string, sizeof(local_ip_string));
-
-        struct in_addr public_ip;
-        public_ip.s_addr = htonl(public_endpoint.addr);
-        inet_ntop(AF_INET, &public_ip, public_ip_string, sizeof(public_ip_string));
-        
-        snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n%s:%u\n%s:%u", ers_id, local_ip_string, local_endpoint.port, public_ip_string, public_endpoint.port);
+        int offset = 0;
+        offset = snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n", ers_id);
+        for (int i = 0; i < my_endpoints_len; i++) {
+          struct in_addr ip;
+          ip.s_addr = htonl(my_endpoints[i].addr);
+          inet_ntop(AF_INET, &ip, ip_string[i], sizeof(ip_string[i]));
+          offset += snprintf(register_ers_req + offset, sizeof(register_ers_req) - offset, "%s:%u\n", ip_string[i], my_endpoints[i].port);
+        }
         register_ers_req_len = strlen(register_ers_req);
+        printf("%s\n", register_ers_req);
 
         snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
         expected_ers_response_len = strlen(expected_ers_response);
@@ -685,10 +713,13 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint loc
               char *reply_port_str = payload;
               int reply_port = atoi(reply_port_str);
 
-              bool is_self =
-                  (strcmp(reply_ip_str, local_ip_string)  == 0 && reply_port == local_endpoint.port) ||
-                  (strcmp(reply_ip_str, public_ip_string) == 0 && reply_port == public_endpoint.port);
-
+              bool is_self = false;
+              for (int i = 0; i < my_endpoints_len; i++) {
+                if (strcmp(reply_ip_str, ip_string[i])  == 0 && reply_port == my_endpoints[i].port) {
+                  is_self = true;
+                  break;
+                }
+              }
               if (is_self) continue;
 
               struct addrinfo *peer_addr;
@@ -876,18 +907,18 @@ typedef enum {
   R_CLOSED_SHOULD_EXIT
 } SM_Receiver;
 
-void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint local_endpoint, Endpoint public_endpoint, int ers_id) {
+void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len, int ers_id) {
   SM_Receiver state = R_ERS_SETUP;
 
   struct addrinfo *ers_server;
 
-  char local_ip_string[INET_ADDRSTRLEN];
-  char public_ip_string[INET_ADDRSTRLEN];
-  char register_ers_req[256];
-  int register_ers_req_len;
+  assert(my_endpoints_len <= PEERS_CAP);
+  char ip_string[PEERS_CAP][INET_ADDRSTRLEN];
+  char register_ers_req[32 + 24 * PEERS_CAP];
   char expected_ers_response[256];
-  int expected_ers_response_len;
   char query_ers_req[256];
+  int register_ers_req_len;
+  int expected_ers_response_len;
   int query_ers_req_len;
 
   double last_sent_register = 0;
@@ -923,16 +954,16 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint l
           exit(1);
         }
 
-        struct in_addr local_ip;
-        local_ip.s_addr = htonl(local_endpoint.addr);
-        inet_ntop(AF_INET, &local_ip, local_ip_string, sizeof(local_ip_string));
-
-        struct in_addr public_ip;
-        public_ip.s_addr = htonl(public_endpoint.addr);
-        inet_ntop(AF_INET, &public_ip, public_ip_string, sizeof(public_ip_string));
-        
-        snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n%s:%u\n%s:%u", ers_id, local_ip_string, local_endpoint.port, public_ip_string, public_endpoint.port);
+        int offset = 0;
+        offset = snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n", ers_id);
+        for (int i = 0; i < my_endpoints_len; i++) {
+          struct in_addr ip;
+          ip.s_addr = htonl(my_endpoints[i].addr);
+          inet_ntop(AF_INET, &ip, ip_string[i], sizeof(ip_string[i]));
+          offset += snprintf(register_ers_req + offset, sizeof(register_ers_req) - offset, "%s:%u\n", ip_string[i], my_endpoints[i].port);
+        }
         register_ers_req_len = strlen(register_ers_req);
+        printf("%s\n", register_ers_req);
 
         snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
         expected_ers_response_len = strlen(expected_ers_response);
@@ -993,10 +1024,13 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint l
               if (reply_port_str == NULL) continue;
               int reply_port = atoi(reply_port_str);
 
-              bool is_self =
-                  (strcmp(reply_ip_str, local_ip_string)  == 0 && reply_port == local_endpoint.port) ||
-                  (strcmp(reply_ip_str, public_ip_string) == 0 && reply_port == public_endpoint.port);
-
+             bool is_self = false;
+              for (int i = 0; i < my_endpoints_len; i++) {
+                if (strcmp(reply_ip_str, ip_string[i])  == 0 && reply_port == my_endpoints[i].port) {
+                  is_self = true;
+                  break;
+                }
+              }
               if (is_self) continue;
 
               struct addrinfo *peer_addr;
@@ -1154,26 +1188,36 @@ int main(int argc, char **argv) {
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
-  int res;
-  Endpoint local_endpoint;
-  res = get_socket_local_endpoint(sock, &local_endpoint);
-  local_endpoint.addr = INADDR_LOOPBACK;
-
-  if (res < 0) {
-    close(sock);
-    exit(1);
-  }
+  Endpoint my_endpoints[3];
+  int my_endpoints_len = 0;
 
   Endpoint public_endpoint;
-  res = get_socket_public_endpoint(sock, &public_endpoint);
-
-  if (res < 0) {
-    close(sock);
-    exit(1);
+  if (get_socket_public_endpoint(sock, &public_endpoint) == 0) {
+    my_endpoints[my_endpoints_len++] = public_endpoint;
   }
 
-  print_endpoint(local_endpoint);
-  print_endpoint(public_endpoint);
+  Endpoint loopback_endpoint;
+  if (get_socket_loopback_endpoint(sock, &loopback_endpoint) == 0) {
+    loopback_endpoint.addr = INADDR_LOOPBACK;
+    my_endpoints[my_endpoints_len++] = loopback_endpoint;
+
+    uint32_t lan_ip = get_lan_ip();
+    if (lan_ip > 0) {
+      Endpoint local_endpoint = loopback_endpoint;
+      local_endpoint.addr = lan_ip;
+      my_endpoints[my_endpoints_len++] = local_endpoint;
+    }
+  }
+
+  if (my_endpoints_len == 0) {
+    close(sock);
+    printf("Could not get any endpoint\n");
+    return 1;
+  }
+
+  for (int i = 0; i < my_endpoints_len; i++) {
+    print_endpoint(my_endpoints[i]);
+  }
 
   int id;
   if (server) {
@@ -1204,9 +1248,9 @@ int main(int argc, char **argv) {
   pthread_create(&reader_thread, NULL, reader, &reader_args);
 
   if (server) {
-      sender(&reader_ring, &writer_ring, local_endpoint, public_endpoint, id);
+      sender(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, id);
   } else {
-      receiver(&reader_ring, &writer_ring, local_endpoint, public_endpoint, id);
+      receiver(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, id);
   }
 
   atomic_store(&writer_args.should_exit, 1);
