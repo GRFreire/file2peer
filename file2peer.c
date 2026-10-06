@@ -546,7 +546,10 @@ typedef struct {
 } PacketTracker;
 
 typedef enum {
-  S_WAITING_CONNECTION = 0,
+  S_ERS_SETUP = 0,
+  S_ERS_REGISTER,
+  S_ERS_GET_PEERS,
+  S_WAITING_CONNECTION,
   S_OPEN_FILE,
   S_CREATE_NEW_BLOCK,
   S_HANDLE_ACKS,
@@ -557,13 +560,33 @@ typedef enum {
   S_CLOSED_SHOULD_EXIT
 } SM_Sender;
 
+#define PEERS_CAP 8
+
 // TODO: this should be dynamically calculated to account for diferent latencies
 #define PACKET_RETRY_INTERVAL_SECONDS 0.5
 
-void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-  SM_Sender state = S_WAITING_CONNECTION;
+void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint local_endpoint, Endpoint public_endpoint, int ers_id) {
+  SM_Sender state = S_ERS_SETUP;
 
-  double last_sent_connect = 0;
+  struct addrinfo *ers_server;
+
+  char local_ip_string[INET_ADDRSTRLEN];
+  char public_ip_string[INET_ADDRSTRLEN];
+  char register_ers_req[256];
+  int register_ers_req_len;
+  char expected_ers_response[256];
+  int expected_ers_response_len;
+  char query_ers_req[256];
+  int query_ers_req_len;
+
+  double last_sent_register = 0;
+  double last_sent_query = 0;
+
+  Peer peers[PEERS_CAP] = {0};
+  int peers_len = 0;
+  Peer peer = {0};
+
+  double last_sent_connect[PEERS_CAP] = {0};
 
   FILE *fp;
 
@@ -575,36 +598,154 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
 
   double last_sent_close = 0;
 
-  double last_printed_state = 0;
   while(state != S_CLOSED_SHOULD_EXIT) {
     double now = seconds_since_unspecified_epoch();
-    if ((now - last_printed_state) > 1) {
-      last_printed_state = now;
-      printf("State = %d\n", state);
-    }
 
     switch(state) {
-      case S_WAITING_CONNECTION: {
+      case S_ERS_SETUP: {
+        char *ers_addr = "ers.grfreire.com";
+        char *ers_addr_env = getenv("ERS_ADDR");
+        if (ers_addr_env != NULL) ers_addr = ers_addr_env;
+      
+        char *ers_port = "54321";
+        char *ers_port_env = getenv("ERS_PORT");
+        if (ers_port_env != NULL) ers_port = ers_port_env;
+      
+        int ret = getaddrinfo(ers_addr, ers_port, &addr_hints, &ers_server);
+        if (ret != 0) {
+          fprintf(stderr, "Could not get addrinfo for ers server\n");
+          exit(1);
+        }
+
+        struct in_addr local_ip;
+        local_ip.s_addr = htonl(local_endpoint.addr);
+        inet_ntop(AF_INET, &local_ip, local_ip_string, sizeof(local_ip_string));
+
+        struct in_addr public_ip;
+        public_ip.s_addr = htonl(public_endpoint.addr);
+        inet_ntop(AF_INET, &public_ip, public_ip_string, sizeof(public_ip_string));
+        
+        snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n%s:%u\n%s:%u", ers_id, local_ip_string, local_endpoint.port, public_ip_string, public_endpoint.port);
+        register_ers_req_len = strlen(register_ers_req);
+
+        snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
+        expected_ers_response_len = strlen(expected_ers_response);
+
+        snprintf(query_ers_req, sizeof(query_ers_req), "QUERY %d\n", ers_id);
+        query_ers_req_len = strlen(query_ers_req);
+        
+        state = S_ERS_REGISTER;
+      } break;
+
+      case S_ERS_REGISTER: {
+        if ((now - last_sent_register) > PACKET_RETRY_INTERVAL_SECONDS) {
+          add_to_writer(writer_ring, register_ers_req, register_ers_req_len + 1, ers_server->ai_addr, ers_server->ai_addrlen);
+          last_sent_register = now;
+        }
+
         UDPPacket udp_packet;
         int ret = take_from_reader(reader_ring, &udp_packet);
-        if (ret == 0 && addr_cmp(udp_packet.addr, peer.addr) == 0) {
-          PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
-          if (ph.type == PACK_TYP_CONNECT_ACK) {
-            state = S_OPEN_FILE;
-            break;
-          }
-
-          if (ph.type == PACK_TYP_CONNECT) {
-            send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+        if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
+          if (strncmp(expected_ers_response, (char *)udp_packet.buf, expected_ers_response_len) == 0) {
+            state = S_ERS_GET_PEERS;
             break;
           }
         }
+      } break;
 
-        double now = seconds_since_unspecified_epoch();
-        if ((now - last_sent_connect) > PACKET_RETRY_INTERVAL_SECONDS) {
-          send_connect(writer_ring, peer, 0, 0);
-          last_sent_connect = now;
+      case S_ERS_GET_PEERS: {
+        if ((now - last_sent_query) > PACKET_RETRY_INTERVAL_SECONDS) {
+          add_to_writer(writer_ring, query_ers_req, query_ers_req_len, ers_server->ai_addr, ers_server->ai_addrlen);
+          last_sent_query = now;
         }
+
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+        if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
+          char *buf_ptr = (char*)udp_packet.buf;
+
+          int last = udp_packet.len;
+          if (last > MAX_UDP_PACKET_SIZE -1) last = MAX_UDP_PACKET_SIZE - 1;
+          buf_ptr[last] = 0;
+
+          char *reply = strsep(&buf_ptr, " ");
+          if (strcmp(reply, "ENTRIES") != 0) break;
+
+          char *id_str = strsep(&buf_ptr, "\n");
+          int reply_id = atoi(id_str);
+
+          if (reply_id != ers_id) {
+              continue;
+          }
+
+          while (buf_ptr != NULL && buf_ptr[0] != 0) {
+              char *payload = strsep(&buf_ptr, "\n");
+
+              char *reply_ip_str = strsep(&payload, ":");
+              char *reply_port_str = payload;
+              int reply_port = atoi(reply_port_str);
+
+              bool is_self =
+                  (strcmp(reply_ip_str, local_ip_string)  == 0 && reply_port == local_endpoint.port) ||
+                  (strcmp(reply_ip_str, public_ip_string) == 0 && reply_port == public_endpoint.port);
+
+              if (is_self) continue;
+
+              struct addrinfo *peer_addr;
+              int ret = getaddrinfo(reply_ip_str, reply_port_str, &addr_hints, &peer_addr);
+              if (ret != 0) {
+                fprintf(stderr, "Could not get addrinfo for peer\n");
+                continue;
+              }
+
+              Peer peer_candidate = (Peer){
+                  .addr = peer_addr->ai_addr,
+                  .addrlen = peer_addr->ai_addrlen,
+              };
+
+              printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
+
+              if (peers_len < PEERS_CAP) peers[peers_len++] = peer_candidate;
+          }
+
+          if (peers_len >= 1) {
+            state = S_WAITING_CONNECTION;
+            break;
+          }
+        }
+      } break;
+
+      case S_WAITING_CONNECTION: {
+        for (int i = 0; i < peers_len; i++) {
+          if ((now - last_sent_connect[i]) > PACKET_RETRY_INTERVAL_SECONDS) {
+            send_connect(writer_ring, peers[i], 0, 0);
+            last_sent_connect[i] = now;
+          }
+        }
+
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+        if (ret != 0) break;
+
+        int i;
+        for (i = 0; i < peers_len; i++) {
+          if (addr_cmp(udp_packet.addr, peers[i].addr) == 0) break;
+        }
+
+        if (i == peers_len) break;
+
+        PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
+        if (ph.type == PACK_TYP_CONNECT_ACK) {
+          state = S_OPEN_FILE;
+          peer = peers[i];
+          break;
+        }
+
+        if (ph.type == PACK_TYP_CONNECT) {
+          send_ack(writer_ring, peers[i], PACK_TYP_CONNECT_ACK, 0, 0);
+          break;
+        }
+       
       } break;
 
       case S_OPEN_FILE: {
@@ -640,7 +781,6 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
 
       case S_SEND_PACKET: {
         bool has_unconfirmed_packets = false;
-        double now = seconds_since_unspecified_epoch();
         int packets_sent_this_iteration = 0;
         for (int i = 0; i < tracker_len; i++) {
           if (tracker[i].confirmed) continue;
@@ -705,7 +845,6 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
           }
         }
 
-        double now = seconds_since_unspecified_epoch();
         if ((now - last_sent_close) > PACKET_RETRY_INTERVAL_SECONDS) {
           send_close(writer_ring, peer, 0, 0);
           last_sent_close = now;
@@ -725,7 +864,10 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
 }
 
 typedef enum {
-  R_WAITING_CONNECTION = 0,
+  R_ERS_SETUP = 0,
+  R_ERS_REGISTER,
+  R_ERS_GET_PEERS,
+  R_WAITING_CONNECTION,
   R_OPEN_FILE,
   R_READ_DATA,
   R_SEND_CLOSE_ACK,
@@ -734,31 +876,161 @@ typedef enum {
   R_CLOSED_SHOULD_EXIT
 } SM_Receiver;
 
-void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer) {
-  SM_Receiver state = R_WAITING_CONNECTION;
+void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint local_endpoint, Endpoint public_endpoint, int ers_id) {
+  SM_Receiver state = R_ERS_SETUP;
 
-  double last_sent_connect = 0;
-  bool got_connect_ack = false;
+  struct addrinfo *ers_server;
+
+  char local_ip_string[INET_ADDRSTRLEN];
+  char public_ip_string[INET_ADDRSTRLEN];
+  char register_ers_req[256];
+  int register_ers_req_len;
+  char expected_ers_response[256];
+  int expected_ers_response_len;
+  char query_ers_req[256];
+  int query_ers_req_len;
+
+  double last_sent_register = 0;
+  double last_sent_query = 0;
+
+  Peer peers[PEERS_CAP] = {0};
+  int peers_len = 0;
+  Peer peer = {0};
+
+  double last_sent_connect[PEERS_CAP] = {0};
+  bool got_connect_ack[PEERS_CAP] = {0};
 
   FILE *fp;
 
   double last_sent_close_ack;
 
-  double last_printed_state = 0;
   while(state != R_CLOSED_SHOULD_EXIT) {
     double now = seconds_since_unspecified_epoch();
-    if ((now - last_printed_state) > 1) {
-      last_printed_state = now;
-      printf("State = %d\n", state);
-    }
 
     switch(state) {
+      case R_ERS_SETUP: {
+        char *ers_addr = "ers.grfreire.com";
+        char *ers_addr_env = getenv("ERS_ADDR");
+        if (ers_addr_env != NULL) ers_addr = ers_addr_env;
+      
+        char *ers_port = "54321";
+        char *ers_port_env = getenv("ERS_PORT");
+        if (ers_port_env != NULL) ers_port = ers_port_env;
+      
+        int ret = getaddrinfo(ers_addr, ers_port, &addr_hints, &ers_server);
+        if (ret != 0) {
+          fprintf(stderr, "Could not get addrinfo for ers server\n");
+          exit(1);
+        }
+
+        struct in_addr local_ip;
+        local_ip.s_addr = htonl(local_endpoint.addr);
+        inet_ntop(AF_INET, &local_ip, local_ip_string, sizeof(local_ip_string));
+
+        struct in_addr public_ip;
+        public_ip.s_addr = htonl(public_endpoint.addr);
+        inet_ntop(AF_INET, &public_ip, public_ip_string, sizeof(public_ip_string));
+        
+        snprintf(register_ers_req, sizeof(register_ers_req), "REGISTER %d\n%s:%u\n%s:%u", ers_id, local_ip_string, local_endpoint.port, public_ip_string, public_endpoint.port);
+        register_ers_req_len = strlen(register_ers_req);
+
+        snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
+        expected_ers_response_len = strlen(expected_ers_response);
+
+        snprintf(query_ers_req, sizeof(query_ers_req), "QUERY %d\n", ers_id);
+        query_ers_req_len = strlen(query_ers_req);
+        
+        state = R_ERS_REGISTER;
+      } break;
+
+      case R_ERS_REGISTER: {
+        if ((now - last_sent_register) > PACKET_RETRY_INTERVAL_SECONDS) {
+          add_to_writer(writer_ring, register_ers_req, register_ers_req_len + 1, ers_server->ai_addr, ers_server->ai_addrlen);
+          last_sent_register = now;
+        }
+
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+        if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
+          if (strncmp(expected_ers_response, (char *)udp_packet.buf, expected_ers_response_len) == 0) {
+            state = R_ERS_GET_PEERS;
+            break;
+          }
+        }
+      } break;
+
+      case R_ERS_GET_PEERS: {
+        if ((now - last_sent_query) > PACKET_RETRY_INTERVAL_SECONDS) {
+          add_to_writer(writer_ring, query_ers_req, query_ers_req_len, ers_server->ai_addr, ers_server->ai_addrlen);
+          last_sent_query = now;
+        }
+
+        UDPPacket udp_packet;
+        int ret = take_from_reader(reader_ring, &udp_packet);
+        if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
+          char *buf_ptr = (char*)udp_packet.buf;
+
+          int last = udp_packet.len;
+          if (last > MAX_UDP_PACKET_SIZE -1) last = MAX_UDP_PACKET_SIZE - 1;
+          buf_ptr[last] = 0;
+
+          char *reply = strsep(&buf_ptr, " ");
+          if (strcmp(reply, "ENTRIES") != 0) break;
+
+          char *id_str = strsep(&buf_ptr, "\n");
+          if (id_str == NULL) break;
+          int reply_id = atoi(id_str);
+
+          if (reply_id != ers_id) {
+              continue;
+          }
+
+          while (buf_ptr != NULL && buf_ptr[0] != 0) {
+              char *payload = strsep(&buf_ptr, "\n");
+
+              char *reply_ip_str = strsep(&payload, ":");
+              char *reply_port_str = payload;
+              if (reply_port_str == NULL) continue;
+              int reply_port = atoi(reply_port_str);
+
+              bool is_self =
+                  (strcmp(reply_ip_str, local_ip_string)  == 0 && reply_port == local_endpoint.port) ||
+                  (strcmp(reply_ip_str, public_ip_string) == 0 && reply_port == public_endpoint.port);
+
+              if (is_self) continue;
+
+              struct addrinfo *peer_addr;
+              int ret = getaddrinfo(reply_ip_str, reply_port_str, &addr_hints, &peer_addr);
+              if (ret != 0) {
+                fprintf(stderr, "Could not get addrinfo for peer\n");
+                continue;
+              }
+
+              Peer peer_candidate = (Peer){
+                  .addr = peer_addr->ai_addr,
+                  .addrlen = peer_addr->ai_addrlen,
+              };
+
+              printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
+
+              peers[peers_len++] = peer_candidate;
+              if (peers_len >= PEERS_CAP) break;
+          }
+
+          if (peers_len >= 1) {
+            state = R_WAITING_CONNECTION;
+            break;
+          }
+        }
+      } break;
+
       case R_WAITING_CONNECTION: {
-        if (!got_connect_ack) {
-          double now = seconds_since_unspecified_epoch();
-          if ((now - last_sent_connect) > PACKET_RETRY_INTERVAL_SECONDS) {
-            send_connect(writer_ring, peer, 0, 0);
-            last_sent_connect = now;
+        for (int i = 0; i < peers_len; i++) {
+          if (!got_connect_ack[i]) {
+            if ((now - last_sent_connect[i]) > PACKET_RETRY_INTERVAL_SECONDS) {
+              send_connect(writer_ring, peers[i], 0, 0);
+              last_sent_connect[i] = now;
+            }
           }
         }
 
@@ -766,9 +1038,12 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
         int ret = peek_from_reader(reader_ring, &udp_packet);
         if (ret != 0) break;
 
-        if (addr_cmp(udp_packet.addr, peer.addr) != 0) {
-          print_addr("dropped, got ", udp_packet.addr);
-          print_addr("        want", peer.addr);
+        int i;
+        for (i = 0; i < peers_len; i++) {
+          if (addr_cmp(udp_packet.addr, peers[i].addr) == 0) break;
+        }
+
+        if (i == peers_len) {
           take_from_reader(reader_ring, NULL);
           break;
         }
@@ -776,6 +1051,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
         PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
         if (ph.type == PACK_TYP_DATA) {
           state = R_OPEN_FILE;
+          peer = peers[i];
           break;
         }
 
@@ -783,12 +1059,12 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
         assert(ret == 0);
 
         if (ph.type == PACK_TYP_CONNECT) {
-          send_ack(writer_ring, peer, PACK_TYP_CONNECT_ACK, 0, 0);
+          send_ack(writer_ring, peers[i], PACK_TYP_CONNECT_ACK, 0, 0);
           break;
         }
 
         if (ph.type == PACK_TYP_CONNECT_ACK) {
-          got_connect_ack = true;
+          got_connect_ack[i] = true;
           break;
         }
       } break;
@@ -840,8 +1116,6 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
           }
         }
 
-        double now = seconds_since_unspecified_epoch();
-
         if ((now - last_sent_close_ack) > 3 * PACKET_RETRY_INTERVAL_SECONDS) {
           state = R_CLOSE_FILE;
           break;
@@ -862,109 +1136,6 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Peer peer)
   }
 }
 
-Peer find_peer(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, int sock, Endpoint my_endpoint, int id) {
-  struct addrinfo *ers_server;
-
-  char *ers_addr = "ers.grfreire.com";
-  char *ers_addr_env = getenv("ERS_ADDR");
-  if (ers_addr_env != NULL) ers_addr = ers_addr_env;
-
-  char *ers_port = "54321";
-  char *ers_port_env = getenv("ERS_PORT");
-  if (ers_port_env != NULL) ers_port = ers_port_env;
-
-  int ret = getaddrinfo(ers_addr, ers_port, &addr_hints, &ers_server);
-  if (ret != 0) {
-    fprintf(stderr, "Could not get addrinfo for ers server\n");
-    exit(1);
-  }
-
-  struct in_addr ip;
-  ip.s_addr = htonl(my_endpoint.addr);
-
-  char ip_string[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &ip, ip_string, sizeof(ip_string));
-
-  char req[128];
-  int req_len = snprintf(req, sizeof(req), "REGISTER %d\n%s:%u", id, ip_string, my_endpoint.port);
-  add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
-
-  double last_sent_query = seconds_since_unspecified_epoch();
-  req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
-  add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
-
-  Peer peer = {0};
-  bool found_peer = false;
-  while(!found_peer) {
-    double now = seconds_since_unspecified_epoch();
-    if ((now - last_sent_query) > 2 * PACKET_RETRY_INTERVAL_SECONDS) {
-      req_len = snprintf(req, sizeof(req), "QUERY %d\n", id);
-      add_to_writer(writer_ring, req, req_len, ers_server->ai_addr, ers_server->ai_addrlen);
-      last_sent_query = now;
-    }
-
-    UDPPacket udp_packet;
-    int ret = take_from_reader(reader_ring, &udp_packet);
-    if (ret == -1) continue;
-    if (addr_cmp(udp_packet.addr, ers_server->ai_addr) != 0) {
-      print_addr("ERS dropped, got ", udp_packet.addr);
-      print_addr("           want", ers_server->ai_addr);
-      continue;
-    }
-
-    char *buf_ptr = (char*)udp_packet.buf;
-
-    int last = udp_packet.len;
-    if (last > MAX_UDP_PACKET_SIZE -1) last = MAX_UDP_PACKET_SIZE - 1;
-    buf_ptr[last] = 0;
-
-    char *reply = strsep(&buf_ptr, " ");
-    if (strcmp(reply, "ENTRIES") != 0) continue;
-
-    char *id_str = strsep(&buf_ptr, "\n");
-    int reply_id = atoi(id_str);
-
-    if (reply_id != id) {
-        printf("got entries for other id. my id: %d received: %d\n", id, reply_id);
-        continue;
-    }
-
-    while (buf_ptr != NULL && buf_ptr[0] != 0) {
-        char *payload = strsep(&buf_ptr, "\n");
-
-        char *reply_ip_str = strsep(&payload, ":");
-        char *reply_port_str = payload;
-        int reply_port = atoi(reply_port_str);
-
-        if (strcmp(reply_ip_str, ip_string) == 0 && reply_port == my_endpoint.port) continue;
-
-        struct addrinfo *peer_addr;
-        int ret = getaddrinfo(reply_ip_str, reply_port_str, &addr_hints, &peer_addr);
-        if (ret != 0) {
-          fprintf(stderr, "Could not get addrinfo for peer\n");
-          continue;
-        }
-
-        peer = (Peer){
-            .fd = sock,
-            .addr = peer_addr->ai_addr,
-            .addrlen = peer_addr->ai_addrlen,
-        };
-
-        found_peer = true;
-
-        printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
-        break;
-    }
-  }
-
-  return peer;
-}
-
-
-#define LOCAL 0
-
-
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
@@ -983,20 +1154,26 @@ int main(int argc, char **argv) {
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
-  Endpoint endpoint;
   int res;
-  if (LOCAL) {
-    res = get_socket_local_endpoint(sock, &endpoint);
-    endpoint.addr = INADDR_LOOPBACK;
-  } else {
-    res = get_socket_public_endpoint(sock, &endpoint);
-  }
+  Endpoint local_endpoint;
+  res = get_socket_local_endpoint(sock, &local_endpoint);
+  local_endpoint.addr = INADDR_LOOPBACK;
+
   if (res < 0) {
     close(sock);
     exit(1);
   }
 
-  print_endpoint(endpoint);
+  Endpoint public_endpoint;
+  res = get_socket_public_endpoint(sock, &public_endpoint);
+
+  if (res < 0) {
+    close(sock);
+    exit(1);
+  }
+
+  print_endpoint(local_endpoint);
+  print_endpoint(public_endpoint);
 
   int id;
   if (server) {
@@ -1026,12 +1203,10 @@ int main(int argc, char **argv) {
   pthread_t reader_thread;
   pthread_create(&reader_thread, NULL, reader, &reader_args);
 
-  Peer peer = find_peer(&reader_ring, &writer_ring, sock, endpoint, id);
-
   if (server) {
-      sender(&reader_ring, &writer_ring, peer);
+      sender(&reader_ring, &writer_ring, local_endpoint, public_endpoint, id);
   } else {
-      receiver(&reader_ring, &writer_ring, peer);
+      receiver(&reader_ring, &writer_ring, local_endpoint, public_endpoint, id);
   }
 
   atomic_store(&writer_args.should_exit, 1);
