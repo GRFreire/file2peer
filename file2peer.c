@@ -608,7 +608,8 @@ typedef enum {
 // TODO: this should be dynamically calculated to account for diferent latencies
 #define PACKET_RETRY_INTERVAL_SECONDS 0.5
 
-void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len, int ers_id) {
+void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len,
+            char *filename, int ers_id) {
   SM_Sender state = S_ERS_SETUP;
 
   struct addrinfo *ers_server;
@@ -794,7 +795,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
       } break;
 
       case S_OPEN_FILE: {
-        fp = fopen("./image.jpg", "rb");
+        fp = fopen(filename, "rb");
         state = S_CREATE_NEW_BLOCK;
       } break;
 
@@ -921,7 +922,8 @@ typedef enum {
   R_CLOSED_SHOULD_EXIT
 } SM_Receiver;
 
-void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len, int ers_id) {
+void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my_endpoints, int my_endpoints_len,
+              char *filename, int ers_id) {
   SM_Receiver state = R_ERS_SETUP;
 
   struct addrinfo *ers_server;
@@ -1118,7 +1120,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
       } break;
 
       case R_OPEN_FILE: {
-        fp = fopen("./recv_image.jpg", "wb");
+        fp = fopen(filename, "wb");
         fseek(fp, 0, SEEK_SET);
         state = R_READ_DATA;
       } break;
@@ -1185,20 +1187,22 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <send|receive> FILE\n", argv[0]);
     return -1;
   }
 
-  bool server = false;
-  if (strcmp("server", argv[1]) == 0) {
-    server = true;
-  } else if (strcmp("client", argv[1]) == 0) {
-    server = false;
+  bool cmd_send = false;
+  if (strcmp("send", argv[1]) == 0) {
+    cmd_send = true;
+  } else if (strcmp("receive", argv[1]) == 0) {
+    cmd_send = false;
   } else {
-    fprintf(stderr, "Usage: %s <client|server>\n", argv[0]);
+    fprintf(stderr, "Usage: %s <send|receive> FILE\n", argv[0]);
     return -1;
   }
+
+  char *filename = argv[2];
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -1236,7 +1240,7 @@ int main(int argc, char **argv) {
   }
 
   int id;
-  if (server) {
+  if (cmd_send) {
       srand(time(0));
       id = rand();
       printf("ID: %d\n", id);
@@ -1263,10 +1267,10 @@ int main(int argc, char **argv) {
   pthread_t reader_thread;
   pthread_create(&reader_thread, NULL, reader, &reader_args);
 
-  if (server) {
-      sender(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, id);
+  if (cmd_send) {
+      sender(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, filename, id);
   } else {
-      receiver(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, id);
+      receiver(&reader_ring, &writer_ring, my_endpoints, my_endpoints_len, filename, id);
   }
 
   atomic_store(&writer_args.should_exit, 1);
