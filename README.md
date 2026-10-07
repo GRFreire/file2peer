@@ -25,7 +25,7 @@ Qualquer Linux atual com gcc compatível com C11 (`-std=gnu11`) e glibc com `get
 ## Compilação
 
 ```sh
-make
+make all
 ```
 
 Gera os executáveis `file2peer` (transferência) e `ers` (servidor de encontro).
