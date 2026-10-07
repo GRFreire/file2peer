@@ -56,11 +56,15 @@ Cada fila é um buffer circular com **um produtor e um consumidor**, o que dispe
 
 Como a thread principal só usa operações não bloqueantes sobre as filas, ela consegue cuidar de temporizadores e retransmissões no mesmo laço.
 
+### Tratamento de falhas nas threads de rede
+
+Erros passageiros de rede (por exemplo `EINTR`, `ENOBUFS`, `EHOSTUNREACH`) são ignorados: o pacote é descartado e a retransmissão do protocolo o recupera. Um erro fatal em `sendto`, `recvfrom` ou `sem_wait` faz a thread registrar o `errno` na sua fila e terminar. A thread principal confere esse registro a cada passada do laço, e, se houver falha, encerra a transferência com erro e libera os recursos.
+
 ## 3. Descoberta de peers
 
 ### 3.1 STUN
 
-**STUN** (*Session Traversal Utilities for NAT*, RFC 5389) é um protocolo existente que permite a um host descobrir o endereço IP e a porta públicos que o NAT lhe atribuiu. O programa envia um *Binding Request* ao servidor STUN **pelo mesmo socket** que usará depois, e lê o atributo `XOR-MAPPED-ADDRESS` da resposta. A construção e a interpretação das mensagens foram implementadas manualmente (cabeçalho de 20 bytes, atributos TLV, XOR com o *magic cookie*). Por padrão é usado o servidor público do Google.
+**STUN** (*Session Traversal Utilities for NAT*, RFC 5389) é um protocolo existente que permite a um host descobrir o endereço IP e a porta públicos que o NAT lhe atribuiu. O programa envia um *Binding Request* ao servidor STUN **pelo mesmo socket** que usará depois, e lê o atributo `XOR-MAPPED-ADDRESS` da resposta. A construção e a interpretação das mensagens foram implementadas manualmente (cabeçalho de 20 bytes, atributos TLV, XOR com o *magic cookie*). Por padrão é usado o servidor público do Google. O pedido é reenviado a cada 0,5 s e, se não houver resposta em 2 s, o programa segue apenas com os endereços locais.
 
 ### 3.2 ERS (Endpoint Rendezvous Server)
 
@@ -94,6 +98,13 @@ Resposta:
 ENTRIES <id>
 <ip:porta>
 <ip:porta>
+```
+
+Se o pedido for inválido (ID inválido, comando inexistente, texto longo demais para ser registrado), o ERS responde com uma mensagem de erro, que o cliente trata como falha:
+
+```
+ERROR
+<motivo>
 ```
 
 ### 3.3 Candidatos e fluxo
@@ -167,7 +178,7 @@ sequenceDiagram
 ```
 
 - O **remetente** considera a conexão estabelecida ao receber o primeiro `CONNECT_ACK` e passa a usar só aquele endereço.
-- O **destinatário** fixa o peer quando chega o primeiro `DATA`. Assim, mesmo que um `CONNECT_ACK` se perca, o primeiro dado já prova que a conexão existe.
+- O **destinatário** fixa o peer quando chega o primeiro `DATA`. Assim, mesmo que um `CONNECT_ACK` se perca, o primeiro dado já prova que a conexão existe. No caso de um arquivo vazio não há `DATA`, e o primeiro `CLOSE` cumpre esse papel.
 - Pacotes de endereços que não estão entre os candidatos conhecidos são ignorados.
 
 ## 7. Transferência de dados
@@ -189,6 +200,8 @@ O destinatário, para cada `DATA`, grava os bytes na posição `offset` do arqui
 | perda de `DATA_ACK` | o remetente retransmite; o destinatário grava e confirma de novo |
 | reordenação ou duplicação | gravação por *offset* absoluto |
 
+Se o arquivo for vazio, nenhum `DATA` é enviado: o remetente passa direto ao encerramento e o destinatário cria um arquivo vazio.
+
 ## 8. Encerramento
 
 Nenhum protocolo consegue garantir que os dois lados saibam que o outro terminou (o problema dos Dois Generais). A solução adotada segue a ideia do `TIME_WAIT` do TCP: **quem envia o último ACK espera um tempo para reenviá-lo, se precisar**.
@@ -207,11 +220,13 @@ sequenceDiagram
 - O destinatário responde `CLOSE_ACK` e permanece 1,5 s (3 vezes o intervalo de retransmissão) respondendo a eventuais `CLOSE` repetidos. Isso cobre a perda do `CLOSE_ACK`: o `CLOSE` retransmitido ainda encontra quem responda.
 - Ao chegar ao `CLOSE`, todos os dados já foram confirmados, então ele é apenas o aviso final.
 
-Por fim, o programa principal sinaliza o encerramento às threads de rede, faz `pthread_join` e fecha o socket.
+Por fim, o programa principal encerra as threads de rede: cancela o reader (que fica bloqueado em `recvfrom`) e pede ao writer que termine depois de esvaziar a fila, o que garante que o último `CLOSE_ACK` seja enviado. Depois faz `pthread_join` de ambas, libera filas e semáforos e fecha o socket.
 
 ## 9. Máquinas de estado
 
 Toda a lógica roda em um laço `while (state != EXIT) { switch (state) ... }` na thread principal. Cada passada trata **um** estado sem bloquear, e o tempo é lido uma vez por iteração para decidir retransmissões. Assim, eventos de rede e temporizadores são tratados no mesmo lugar, sem uma thread por conexão.
+
+Qualquer falha fatal (erro de arquivo, resposta de erro do ERS, falha em uma thread de rede) interrompe o laço, libera os recursos e faz o programa terminar com código de saída diferente de zero. Antes de iniciar a rede, o remetente já confere se o arquivo pode ser lido, para não registrar no ERS e esperar o outro lado à toa. As verificações de falha estão resumidas no [`README.md`](README.md#verificação-de-falhas).
 
 ### 9.1 Remetente (`send`)
 
@@ -241,7 +256,7 @@ stateDiagram-v2
     ERS_SETUP --> ERS_REGISTER: resolve o ERS e monta as mensagens
     ERS_REGISTER --> ERS_GET_PEERS: recebeu REGISTERED
     ERS_GET_PEERS --> WAITING_CONNECTION: recebeu candidatos do outro peer
-    WAITING_CONNECTION --> OPEN_FILE: primeiro DATA do peer
+    WAITING_CONNECTION --> OPEN_FILE: primeiro DATA (ou CLOSE) do peer
     OPEN_FILE --> READ_DATA: cria o arquivo de saída
     READ_DATA --> READ_DATA: DATA, grava e envia DATA_ACK
     READ_DATA --> SEND_CLOSE_ACK: recebeu CLOSE
@@ -292,7 +307,7 @@ sequenceDiagram
 
 O projeto é uma prova de conceito que cobre o caminho completo de uma transferência peer to peer: descoberta, conexão através de NAT, transferência confiável e encerramento. Para manter o foco nesses conceitos, algumas escolhas são simples:
 
-- uma transferência de um arquivo entre dois peers por execução, em IPv4;
+- uma transferência de um arquivo (de até 4 GiB, pois os *offsets* têm 32 bits) entre dois peers por execução, em IPv4;
 - intervalo de retransmissão fixo (0,5 s), com envio em pequenos lotes;
 - o ID de sessão é apenas um identificador de encontro, sem autenticação ou criptografia;
 - a conexão por *hole punching* funciona com NATs do tipo *cone*; em NAT simétrico ou redes que bloqueiam UDP, seria necessário um relay.
