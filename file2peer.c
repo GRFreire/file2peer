@@ -260,7 +260,7 @@ int get_socket_loopback_endpoint(int sock, Endpoint *out_endpoint) {
   return 0;
 }
 
-int get_lan_ip() {
+uint32_t get_lan_ip() {
   int tmp_sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (tmp_sock == -1) return -1;
 
