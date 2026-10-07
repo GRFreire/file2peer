@@ -82,8 +82,8 @@ Para usar outros servidores, há variáveis de ambiente (devem ter o mesmo valor
 Exemplo:
 
 ```sh
-ERS_ADDR=192.168.0.10 ./file2peer send foto.jpg
-ERS_ADDR=192.168.0.10 ./file2peer receive foto_recebida.jpg
+ERS_ADDR=127.0.0.1 ./file2peer send foto.jpg
+ERS_ADDR=127.0.0.1 ./file2peer receive foto_recebida.jpg
 ```
 
 ### Rodando o seu próprio ERS
@@ -96,6 +96,22 @@ O ERS escuta em UDP na porta `54321` (ou na indicada em `ERS_PORT`), em todas as
 
 Se o STUN estiver inacessível, o programa segue com os endereços locais (loopback e LAN), o que basta para transferências na mesma máquina ou na mesma rede.
 
-<!--
-TODO: seção "Verificação de falhas"
--->
+## Verificação de falhas
+
+Toda chamada ao sistema que pode falhar tem o retorno verificado. A mensagem de erro (com `strerror(errno)`) vai para `stderr` e o programa encerra com código de saída diferente de zero quando a falha é irrecuperável.
+
+| Situação | Comportamento |
+|----------|---------------|
+| Falha ao criar o socket, alocar memória, criar threads ou semáforos | Mensagem de erro e encerramento (`EXIT_FAILURE`) |
+| Arquivo a enviar inexistente ou ilegível | Detectado antes de contatar o ERS |
+| Erro de leitura do arquivo (`fread`/`ferror`) | Aborta, em vez de enviar o arquivo truncado |
+| Erro ao gravar o arquivo recebido (`fseek`, `fwrite`, `fflush`, `fclose`) | Aborta com mensagem (ex.: disco cheio) |
+| ID de sessão inválido ou entrada vazia | Mensagem de erro e encerramento |
+| Falha ao resolver o ERS (`getaddrinfo`) ou resposta `ERROR` do ERS | Mensagem de erro e encerramento |
+| STUN inacessível ou sem resposta (2 s) | Aviso; segue só com endereços locais (loopback e LAN) |
+| Interface de LAN não encontrada | Aviso; segue sem o candidato de LAN |
+| Erro fatal de `sendto`/`recvfrom` nas threads de rede | Registrado pela thread; a principal percebe, encerra com erro e libera os recursos |
+| Erro passageiro de rede (`EINTR`, `ENOBUFS`, `EHOSTUNREACH` etc.) | Ignorado; a retransmissão do protocolo recupera o pacote |
+| Pacote curto, `DATA` incompleto, endereço desconhecido ou linha inválida do ERS | Descartado |
+| Perda, duplicação ou reordenação de pacotes UDP | Tratado pelo protocolo (ACKs, retransmissão e offsets absolutos) |
+
