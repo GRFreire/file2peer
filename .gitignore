@@ -2,3 +2,4 @@
 *.hex
 file2peer
 ers
+*.o

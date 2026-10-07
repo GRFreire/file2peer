@@ -1,12 +1,26 @@
-.PHONY: all
+CC := gcc
+CFLAGS := -Wall -Wextra -Wno-unused-variable -ggdb -pthread -lm
+
+PROGRAM := file2editor
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $< 
+
+file2peer: file2peer.o common.o endpoint.o receiver.o sender.o stun.o utils.o
+	$(CC) $(LDFLAGS) -o $@ $^$> 
+
+ers: ers.c
+	$(CC) $(LDFLAGS) -o $@ $^$> 
+
+.PHONY: all run clean zip
 
 all: file2peer ers
 
-file2peer: file2peer.c
-	gcc -Wall -Wextra -ggdb -pthread file2peer.c -o file2peer
-
-ers: ers.c
-	gcc -Wall -Wextra -ggdb ers.c -o ers
+run:
+	./file2peer
 
 clean:
-	rm -f client
+	rm -f *.o file2peer ers code.zip
+
+zip:
+	zip -r code.zip *.c *.h *.md Makefile
