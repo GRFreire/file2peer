@@ -690,6 +690,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
         int ret = take_from_reader(reader_ring, &udp_packet);
         if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
           if (strncmp(expected_ers_response, (char *)udp_packet.buf, expected_ers_response_len) == 0) {
+            printf("Registered on ERS\n");
             state = S_ERS_GET_PEERS;
             break;
           }
@@ -749,12 +750,11 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
                   .addrlen = peer_addr->ai_addrlen,
               };
 
-              printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
-
               if (peers_len < PEERS_CAP) peers[peers_len++] = peer_candidate;
           }
 
           if (peers_len >= 1) {
+            printf("Found peer information\n");
             state = S_WAITING_CONNECTION;
             break;
           }
@@ -782,6 +782,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
 
         PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
         if (ph.type == PACK_TYP_CONNECT_ACK) {
+          printf("Connected to peer\n");
           state = S_OPEN_FILE;
           peer = peers[i];
           break;
@@ -803,6 +804,7 @@ void sender(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *my
         file_offset = file_next_offset;
         int len = fread(file_buffer, 1, BLOCK_SIZE, fp);
         if (len == 0) {
+            printf("File sent! Closing connection\n");
             state = S_SHOULD_CLOSE;
             break;
         }
@@ -979,7 +981,6 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
           offset += snprintf(register_ers_req + offset, sizeof(register_ers_req) - offset, "%s:%u\n", ip_string[i], my_endpoints[i].port);
         }
         register_ers_req_len = strlen(register_ers_req);
-        printf("%s\n", register_ers_req);
 
         snprintf(expected_ers_response, sizeof(expected_ers_response), "REGISTERED %d\n", ers_id);
         expected_ers_response_len = strlen(expected_ers_response);
@@ -1000,6 +1001,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
         int ret = take_from_reader(reader_ring, &udp_packet);
         if (ret == 0 && addr_cmp (udp_packet.addr, ers_server->ai_addr) == 0) {
           if (strncmp(expected_ers_response, (char *)udp_packet.buf, expected_ers_response_len) == 0) {
+            printf("Registered on ERS\n");
             state = R_ERS_GET_PEERS;
             break;
           }
@@ -1061,13 +1063,12 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
                   .addrlen = peer_addr->ai_addrlen,
               };
 
-              printf("Found peer: %s:%d\n", reply_ip_str, reply_port);
-
               peers[peers_len++] = peer_candidate;
               if (peers_len >= PEERS_CAP) break;
           }
 
           if (peers_len >= 1) {
+            printf("Found peer information\n");
             state = R_WAITING_CONNECTION;
             break;
           }
@@ -1100,6 +1101,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
 
         PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, NULL);
         if (ph.type == PACK_TYP_DATA) {
+          printf("Connected to peer\n");
           state = R_OPEN_FILE;
           peer = peers[i];
           break;
@@ -1134,6 +1136,7 @@ void receiver(UDPRingBuffer *reader_ring, UDPRingBuffer *writer_ring, Endpoint *
         PacketHeader ph = parse_packet(udp_packet.buf, udp_packet.len, &data);
 
         if (ph.type == PACK_TYP_CLOSE) {
+          printf("File received! Closing connection\n");
           state = R_SEND_CLOSE_ACK;
           break;
         }
@@ -1235,17 +1238,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  for (int i = 0; i < my_endpoints_len; i++) {
-    print_endpoint(my_endpoints[i]);
-  }
-
   int id;
   if (cmd_send) {
       srand(time(0));
       id = rand();
-      printf("ID: %d\n", id);
+      printf("ERS id: %d\n", id);
   } else {
-      printf("What is the ID? ");
+      printf("What is the ERS id? ");
       char line[LINE_BUF_SIZE];
       fgets(line, LINE_BUF_SIZE, stdin);
       char *id_str = strtok(line, "\n\r");
